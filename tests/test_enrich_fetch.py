@@ -132,3 +132,133 @@ async def test_fetch_stops_after_three_redirects(client: PoliteClient) -> None:
 async def test_fetch_rejects_non_http_scheme(client: PoliteClient) -> None:
     result = await client.fetch("file:///etc/passwd")
     assert result.error == "unsafe_url:unsupported_scheme"
+
+
+@respx.mock
+async def test_fetch_rejects_binary_content_type(client: PoliteClient) -> None:
+    respx.get("https://a.pl/file.pdf").mock(
+        return_value=Response(200, content=b"%PDF-1.7", headers={"Content-Type": "application/pdf"})
+    )
+
+    result = await client.fetch("https://a.pl/file.pdf")
+
+    assert result.status == 200
+    assert result.error == "content_type:application/pdf"
+    assert result.html == ""
+
+
+class FakeHTTP:
+    def __init__(self, mapping: dict[str, object]) -> None:
+        self.mapping = mapping
+        self.calls: list[str] = []
+
+    async def fetch(self, url: str, **kwargs: object):
+        self.calls.append(url)
+        value = self.mapping.get(url)
+        if callable(value):
+            return value()
+        return value
+
+
+class FakeBrowser(FakeHTTP):
+    pass
+
+
+def snapshot(url: str, html: str = "<html>ok</html>", status: int = 200, engine: str = "http"):
+    from forgesmith.enrichment.models import FetchResult
+
+    return FetchResult(
+        url=url,
+        final_url=url,
+        status=status,
+        html=html,
+        engine=engine,
+        bytes=len(html),
+    )
+
+
+async def test_site_fetcher_escalates_and_sticks_to_browser(monkeypatch) -> None:
+    from forgesmith.config import settings
+    from forgesmith.enrichment.fetch import SiteFetcher
+
+    monkeypatch.setattr(settings, "enrich_respect_robots", False)
+    http = FakeHTTP({"https://a.pl/": snapshot("https://a.pl/", status=403)})
+    browser = FakeBrowser(
+        {
+            "https://a.pl/": snapshot("https://a.pl/", engine="browser"),
+            "https://a.pl/kontakt": snapshot("https://a.pl/kontakt", engine="browser"),
+        }
+    )
+    fetcher = SiteFetcher(settings=settings, http=http, browser=browser)
+
+    first = await fetcher.fetch("https://a.pl/")
+    second = await fetcher.fetch("https://a.pl/kontakt")
+
+    assert first.engine == "browser"
+    assert second.engine == "browser"
+    assert http.calls == ["https://a.pl/"]
+    assert browser.calls == ["https://a.pl/", "https://a.pl/kontakt"]
+
+
+async def test_site_fetcher_escalates_on_challenge_page(monkeypatch) -> None:
+    from forgesmith.config import settings
+    from forgesmith.enrichment.fetch import SiteFetcher
+
+    monkeypatch.setattr(settings, "enrich_respect_robots", False)
+    http = FakeHTTP(
+        {"https://a.pl/": snapshot("https://a.pl/", "<html><title>Just a moment...</title></html>")}
+    )
+    browser = FakeBrowser({"https://a.pl/": snapshot("https://a.pl/", engine="browser")})
+    result = await SiteFetcher(settings=settings, http=http, browser=browser).fetch("https://a.pl/")
+    assert result.engine == "browser"
+    assert result.error is None
+
+
+async def test_site_fetcher_keeps_http_result_when_browser_is_unavailable(monkeypatch) -> None:
+    from forgesmith.config import settings
+    from forgesmith.enrichment.fetch import SiteFetcher
+
+    monkeypatch.setattr(settings, "enrich_respect_robots", False)
+    http = FakeHTTP({"https://a.pl/": snapshot("https://a.pl/", status=403)})
+    browser = FakeBrowser(
+        {"https://a.pl/": snapshot("https://a.pl/", status=None, engine="browser")}
+    )
+    browser.mapping["https://a.pl/"].error = "browser_unavailable:ImportError"
+
+    result = await SiteFetcher(settings=settings, http=http, browser=browser).fetch("https://a.pl/")
+    assert result.engine == "http"
+    assert result.status == 403
+
+
+async def test_site_fetcher_respects_robots(monkeypatch) -> None:
+    from forgesmith.config import settings
+    from forgesmith.enrichment.fetch import SiteFetcher
+
+    monkeypatch.setattr(settings, "enrich_respect_robots", True)
+    http = FakeHTTP(
+        {
+            "https://a.pl/robots.txt": snapshot(
+                "https://a.pl/robots.txt", "User-agent: *\nDisallow: /private"
+            )
+        }
+    )
+    result = await SiteFetcher(settings=settings, http=http, browser=None).fetch(
+        "https://a.pl/private"
+    )
+    assert result.error == "robots_disallowed"
+    assert http.calls == ["https://a.pl/robots.txt"]
+
+
+async def test_site_fetcher_deadline_returns_without_fetching(monkeypatch) -> None:
+    import time
+
+    from forgesmith.config import settings
+    from forgesmith.enrichment.fetch import SiteFetcher
+
+    monkeypatch.setattr(settings, "enrich_respect_robots", False)
+    http = FakeHTTP({})
+    result = await SiteFetcher(settings=settings, http=http, browser=None).fetch(
+        "https://a.pl/", deadline=time.monotonic() - 1
+    )
+    assert result.error == "deadline"
+    assert http.calls == []

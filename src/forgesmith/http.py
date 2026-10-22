@@ -27,6 +27,12 @@ _PRIVATE_HOSTS = {
     "metadata",
     "metadata.google.internal",
 }
+_TEXT_CONTENT_TYPES = (
+    "text/",
+    "application/xhtml+xml",
+    "application/xml",
+    "application/json",
+)
 
 
 class HostPacer:
@@ -86,6 +92,14 @@ def validate_public_url(url: str) -> str | None:
         return None
     if not address.is_global:
         return "private_ip"
+    return None
+
+
+def content_type_error(headers: dict[str, str]) -> str | None:
+    """Reject binary payloads before decoding; an absent header is allowed."""
+    content_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type and not content_type.startswith(_TEXT_CONTENT_TYPES):
+        return f"content_type:{content_type}"
     return None
 
 
@@ -225,6 +239,19 @@ class PoliteClient:
                         current = urljoin(current, location)
                         redirects += 1
                         continue
+
+                    unsupported = content_type_error(headers)
+                    if unsupported is not None:
+                        return FetchResult(
+                            url=url,
+                            final_url=current,
+                            status=status,
+                            html="",
+                            headers=headers,
+                            engine="http",
+                            error=unsupported,
+                            elapsed_ms=elapsed(),
+                        )
 
                     body = await self._read_limited(response, cap)
                     html = body.decode(response.encoding or "utf-8", errors="replace")

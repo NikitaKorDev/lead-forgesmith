@@ -12,6 +12,24 @@ from forgesmith.db.models import EnrichmentStatusDB
 
 
 @dataclass(slots=True)
+class RunStats:
+    """Counters for one CLI run; printed as the final summary table."""
+
+    scanned: int = 0
+    resolved: int = 0
+    overridden: int = 0
+    enriched: int = 0
+    skipped: int = 0
+    no_site: int = 0
+    no_contact: int = 0
+    blocked: int = 0
+    failed: int = 0
+    duplicates: int = 0
+    emails: int = 0
+    duration_s: float = 0.0
+
+
+@dataclass(slots=True)
 class FetchResult:
     """Normalised response from either PoliteClient or BrowserFetcher."""
 
@@ -37,6 +55,7 @@ class PageSnapshot:
     engine: str
     bytes: int
     elapsed_ms: int
+    headers: dict[str, str] = field(default_factory=dict)
     error: str | None = None
 
     @property
