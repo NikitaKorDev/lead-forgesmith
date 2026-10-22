@@ -4,18 +4,21 @@ Asynchronous B2B lead pipeline: discover e-commerce merchants, enrich them with
 contact data and business context, generate a personalized Polish pitch, and
 send it at a human pace.
 
-Status: **Phase 0 (scaffold) + Phase 1 (extraction) implemented.** Enrichment,
-LLM personalization, and the mailer are designed but not wired yet — see
+Status: **Phases 0–2 implemented** — scaffold, Shopify/OLX extraction, and
+storefront enrichment (domain resolution, contact emails, business context).
+LLM personalization and the mailer are designed but not wired yet — see
 [Roadmap](#roadmap).
 
 ## Quick start
 
 ```powershell
 uv sync
-uv run playwright install chromium      # only needed for the OLX source
+uv run playwright install chromium      # OLX + enrichment browser fallback
 uv run forgesmith db init
 uv run forgesmith source shopify        # probe data/shopify_seeds.txt (37 verified stores)
 uv run forgesmith source olx -q meble --city warszawa --pages 1
+uv run forgesmith enrich --limit 10
+uv run forgesmith contacts
 uv run forgesmith leads
 uv run forgesmith stats
 ```
@@ -27,6 +30,9 @@ uv run forgesmith stats
 | `forgesmith db init` | Create tables (idempotent) |
 | `forgesmith source shopify [--seeds FILE ...] [--limit N]` | Probe Shopify storefronts, store catalogue metadata |
 | `forgesmith source olx -q meble --city warszawa --pages 2 [--limit N] [--engine http]` | Crawl OLX listing pages into business leads |
+| `forgesmith enrich [--limit N] [--source shopify\|olx] [--lead-id N] [--force]` | Resolve storefronts, extract role-first emails and page context |
+| `forgesmith enrich --resolve-only [--source olx] [--deep-resolve]` | Write candidate domains only; no storefront crawl |
+| `forgesmith contacts [--lead-id N] [--limit 50]` | Inspect contacts Phase 3 will use |
 | `forgesmith leads [--status new] [--source shopify] [--limit 50]` | Inspect stored leads |
 | `forgesmith stats` | Counts by source and status |
 | `forgesmith --log-level debug <command>` | Verbose run |
@@ -78,15 +84,44 @@ are resolved during enrichment.
 forbids scraping. The source interface exists so it can be enabled later through
 the official API.
 
+### Enrichment
+
+Enrichment is sequential by design: per-host pacing already serializes requests,
+and one lead at a time keeps the SQLite write path and Ctrl-C behaviour simple.
+Each lead gets one row in `enrichments` and one terminal status (`ok`,
+`no_site`, `no_contact`, `blocked`, or `error`); retries stay `new` until
+`ENRICH_MAX_ATTEMPTS`.
+
+1. **Resolve** — use `lead.domain` (OLX already maps `externalUrl` into it),
+   then `data/domain_overrides.csv`, then the OLX shop subdomain page, then
+   (only with `--deep-resolve`) the offer page. No search-engine guesses.
+2. **Fetch** — HTTP first, with a 2 MB cap, manual redirect validation against
+   SSRF, and `robots.txt` respected. A 403/challenge/JS shell escalates that
+   host to Chromium for the rest of the run; both engines share one host pacer.
+3. **Extract** — `HTMLParser` visible text (no scripts, styles, or hidden
+   honeypots), `mailto:` links, and JSON-LD. Eligibility is a gate; ranking is
+   role-first (`kontakt`, `sales`, `biuro`, …), capped at 3, with one personal
+   fallback and free-provider role addresses kept.
+4. **Persist** — contacts, NIP/legal name when evidenced, platform, a 3000-char
+   main-content excerpt, headings, a product sample, and page provenance.
+   Raw HTML is never stored. A resolved domain is promoted onto the lead only
+   after the homepage passes the parked/empty check.
+
+Run `forgesmith enrich --source olx --limit 14 --resolve-only` before a full
+crawl to review the OLX domains; that command writes only `enrichments.domain`
+and leaves lead status untouched. Rerunning a completed lead is a no-op;
+`--force` retries it but never downgrades an already-enriched lead.
+
 ### Lead model
 
 `leads` — one row per prospect, unique on `(source, source_id)`, deduped by
 `domain` (one outbound target per domain). `raw` keeps the evidence a source
 collected (product sample, types, prices) for later personalization.
 
-`contacts` · `messages` · `sends` · `suppressions` · `events` complete the
-schema and are created up front so the pipeline stages can be added without
-migrations churn.
+`enrichments` (1:1 with leads) holds resolution provenance, crawl status,
+click-through context, NIP/legal name, and page evidence. `contacts` ·
+`messages` · `sends` · `suppressions` · `events` complete the schema and are
+created up front so the pipeline stages can be added without migrations churn.
 
 ## Database
 
@@ -105,7 +140,9 @@ Adminer is exposed on <http://localhost:8080>.
 
 Copy `.env.example` to `.env`. All keys are prefixed `FORGESMITH_`; the crawler
 knobs that matter are `REQUEST_DELAY` (per-host seconds between requests,
-default 1.5), `MAX_CONCURRENCY`, and `MAX_RETRIES`.
+default 1.5), `MAX_CONCURRENCY`, and `MAX_RETRIES`. Enrichment adds
+`ENRICH_MAX_PAGES`, `ENRICH_LEAD_TIMEOUT`, `ENRICH_PAGE_TIMEOUT`,
+`ENRICH_RESPECT_ROBOTS`, and `ENRICH_DOMAIN_OVERRIDES`; see `.env.example`.
 
 ## Tests
 
@@ -114,7 +151,8 @@ uv run pytest
 ```
 
 Tests never touch the network: sources are exercised against HTML/JSON fixtures,
-and the DB runs on a temporary SQLite file.
+enrichment uses fake fetchers and `respx`, and the DB runs on a temporary SQLite
+file.
 
 ## Roadmap
 
@@ -122,7 +160,7 @@ and the DB runs on a temporary SQLite file.
 |---|---|---|
 | 0 | Scaffold, config, schema, CLI | done |
 | 1 | Extraction: Shopify + OLX | done |
-| 2 | Enrichment: async Playwright, email extraction, platform detection | next |
+| 2 | Enrichment: domain resolution, contacts, context, platform detection | done |
 | 3 | LLM: Ollama, JSON-schema output, Polish prompt, eval set | planned |
 | 4 | Mailer: dry-run `.eml` → Gmail SMTP, jitter, caps, opt-out, IMAP bounce/reply scan | planned |
 | 5 | Docker packaging + unattended scheduler | planned |
