@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from forgesmith.domain import LeadCandidate, LeadSource, UpsertStats, normalize_url, parse_domain
+from forgesmith.domain import (
+    LeadCandidate,
+    LeadSource,
+    UpsertStats,
+    normalize_url,
+    parse_domain,
+    registrable_domain,
+    same_site,
+)
 
 
 @pytest.mark.parametrize(
@@ -54,3 +62,29 @@ def test_upsert_stats_adds() -> None:
     first = UpsertStats(inserted=1, updated=2, duplicates=3)
     second = UpsertStats(inserted=1, updated=1, duplicates=0)
     assert first + second == UpsertStats(inserted=2, updated=3, duplicates=3)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("https://www.sklep.example.com.pl/kontakt", "example.com.pl"),
+        ("example.com.pl", "example.com.pl"),
+        ("sklep.example.pl", "example.pl"),
+        ("example.pl", "example.pl"),
+        ("cdn.shopify.com", "shopify.com"),
+        ("shop.example.waw.pl", "example.waw.pl"),
+        ("example.co.uk", "example.co.uk"),
+        ("127.0.0.1", "127.0.0.1"),
+        ("", None),
+    ],
+)
+def test_registrable_domain(raw: str, expected: str | None) -> None:
+    assert registrable_domain(raw) == expected
+
+
+def test_same_site_uses_registrable_domain() -> None:
+    assert same_site("sklep.example.com.pl", "www.example.com.pl")
+    assert same_site("https://a.example.pl/x", "b.example.pl")
+    assert not same_site("example.com.pl", "example.pl")
+    assert not same_site("a.co.uk", "b.co.uk")
+    assert not same_site("", "example.pl")

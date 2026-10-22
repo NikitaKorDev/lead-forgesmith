@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from enum import StrEnum
 from urllib.parse import urlsplit, urlunsplit
@@ -10,6 +11,100 @@ from pydantic import BaseModel, Field, field_validator
 
 _TRACKING_PARAMS = re.compile(
     r"^(utm_|fbclid|gclid|yclid|msclkid|mc_eid|ref$|source$|_ga)", re.IGNORECASE
+)
+
+# Built-in two-label suffixes. A downloaded public-suffix list (tldextract)
+# would make offline tests depend on the network, so the list stays local.
+_MULTI_LABEL_SUFFIXES = frozenset(
+    {
+        # Poland: functional and the common city domains.
+        "com.pl",
+        "net.pl",
+        "org.pl",
+        "shop.pl",
+        "biz.pl",
+        "info.pl",
+        "edu.pl",
+        "gov.pl",
+        "mil.pl",
+        "nom.pl",
+        "art.pl",
+        "waw.pl",
+        "gd.pl",
+        "krakow.pl",
+        "wroclaw.pl",
+        "poznan.pl",
+        "lodz.pl",
+        "katowice.pl",
+        "gda.pl",
+        "sopot.pl",
+        "szczecin.pl",
+        "lublin.pl",
+        "rzeszow.pl",
+        "bialystok.pl",
+        "bydgoszcz.pl",
+        "torun.pl",
+        "kielce.pl",
+        "olsztyn.pl",
+        "czest.pl",
+        "slupsk.pl",
+        "tychy.pl",
+        "gliwice.pl",
+        "zabrze.pl",
+        "bytom.pl",
+        "rybnik.pl",
+        "radom.pl",
+        "plock.pl",
+        "elblag.pl",
+        "wloclawek.pl",
+        "tarnow.pl",
+        "koszalin.pl",
+        "legnica.pl",
+        "zielonagora.pl",
+        "opole.pl",
+        # Common non-Polish multi-label suffixes seen in the dataset.
+        "co.uk",
+        "org.uk",
+        "ac.uk",
+        "gov.uk",
+        "com.au",
+        "com.br",
+        "co.nz",
+        "co.za",
+        "com.tr",
+        "com.ua",
+        "co.jp",
+        "co.kr",
+        "co.in",
+        "co.il",
+        "com.cn",
+        "com.sg",
+        "com.hk",
+        "com.tw",
+        "com.mx",
+        "com.ar",
+        "com.es",
+        "com.de",
+        "com.fr",
+        "com.it",
+        "com.nl",
+        "com.se",
+        "com.no",
+        "com.dk",
+        "com.fi",
+        "com.cz",
+        "com.sk",
+        "com.hu",
+        "com.ro",
+        "com.bg",
+        "com.hr",
+        "com.rs",
+        "com.by",
+        "com.kz",
+        "com.lt",
+        "com.lv",
+        "com.ee",
+    }
 )
 
 
@@ -63,6 +158,36 @@ def parse_domain(value: str) -> str | None:
     if "." not in host:
         return None
     return host
+
+
+def registrable_domain(value: str) -> str | None:
+    """Return the registrable part of a host: ``sklep.example.com.pl`` → ``example.com.pl``.
+
+    IP literals are returned unchanged; they have no registrable suffix.
+    """
+    host = parse_domain(value)
+    if not host:
+        return None
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return host
+
+    labels = host.split(".")
+    if len(labels) < 2:
+        return host
+    if len(labels) >= 3 and ".".join(labels[-2:]) in _MULTI_LABEL_SUFFIXES:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def same_site(first: str, second: str) -> bool:
+    """True when two hosts belong to the same registrable domain."""
+    left = registrable_domain(first)
+    right = registrable_domain(second)
+    return left is not None and left == right
 
 
 class LeadCandidate(BaseModel):
