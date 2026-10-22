@@ -241,7 +241,44 @@ class EnrichmentRepo:
                 values.emails.add(value)
         return values
 
+    async def list_contacts(
+        self,
+        *,
+        limit: int = 50,
+        lead_id: int | None = None,
+    ) -> Sequence[tuple[Contact, Lead]]:
+        stmt = (
+            select(Contact, Lead)
+            .join(Lead, Lead.id == Contact.lead_id)
+            .order_by(Lead.id, Contact.confidence.desc(), Contact.id)
+            .limit(limit)
+        )
+        if lead_id is not None:
+            stmt = stmt.where(Contact.lead_id == lead_id)
+        rows = await self.session.execute(stmt)
+        return [(contact, lead) for contact, lead in rows]
+
     # ----------------------------------------------------------------- write
+    async def save_resolution(
+        self,
+        lead_id: int,
+        *,
+        domain: str | None,
+        source: str,
+        evidence: dict,
+    ) -> Enrichment:
+        """Record a resolve-only result without touching lead status or domain."""
+        enrichment = await self.get(lead_id)
+        if enrichment is None:
+            enrichment = Enrichment(lead_id=lead_id, status=None, attempts=0)
+            self.session.add(enrichment)
+        enrichment.domain = domain
+        enrichment.domain_source = source if domain else "none"
+        enrichment.evidence = {**(enrichment.evidence or {}), "resolution": evidence}
+        enrichment.updated_at = utcnow()
+        await self.session.flush()
+        return enrichment
+
     async def claim_attempt(self, lead_id: int) -> int:
         """Increment attempts before network I/O so Ctrl-C still advances it."""
         enrichment = await self.get(lead_id)
@@ -318,6 +355,10 @@ class EnrichmentRepo:
                 result,
                 limit=email_limit,
             )
+            if status == EnrichmentStatusDB.OK and stored == 0:
+                # Every candidate was suppressed; there is nothing Phase 3 can use.
+                status = EnrichmentStatusDB.NO_CONTACT
+                enrichment.status = status
 
             if status == EnrichmentStatusDB.OK:
                 lead.status = LeadStatusDB.ENRICHED

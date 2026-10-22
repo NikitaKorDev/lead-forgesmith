@@ -9,6 +9,7 @@ from forgesmith.enrichment.models import (
     EnrichmentResult,
     FetchResult,
     PageSnapshot,
+    RunStats,
 )
 
 __all__ = [
@@ -16,6 +17,7 @@ __all__ = [
     "EnrichmentResult",
     "FetchResult",
     "PageSnapshot",
+    "RunStats",
     "enrich_pending",
 ]
 

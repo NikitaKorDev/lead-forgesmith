@@ -16,8 +16,9 @@ from forgesmith import __version__
 from forgesmith.browser import BrowserFetcher
 from forgesmith.config import settings
 from forgesmith.console import force_utf8_stdio
-from forgesmith.db import LeadRepo, init_db, session_scope
+from forgesmith.db import EnrichmentRepo, LeadRepo, init_db, session_scope
 from forgesmith.domain import LeadCandidate, UpsertStats
+from forgesmith.enrichment import RunStats, enrich_pending
 from forgesmith.http import PoliteClient
 from forgesmith.logs import configure_logging
 from forgesmith.sources import BaseSource, OlxSource, ShopifySource, seeds_from_paths
@@ -211,6 +212,109 @@ def stats() -> None:
             table.add_row(f"status: {name}", str(count))
         for name, count in sorted(by_source.items(), key=lambda item: -item[1]):
             table.add_row(f"source: {name}", str(count))
+        console.print(table)
+
+    asyncio.run(main())
+
+
+# ---------------------------------------------------------------- enrichment
+@app.command("enrich")
+def enrich(
+    limit: Annotated[int | None, typer.Option(help="Max leads to process.")] = None,
+    source: Annotated[str | None, typer.Option(help="Filter by source, e.g. shopify.")] = None,
+    lead_id: Annotated[int | None, typer.Option(help="Process a single lead id.")] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Re-enrich new/enriched/skipped leads; never sent ones."),
+    ] = False,
+    engine: Annotated[
+        str,
+        typer.Option(help="auto (HTTP first, browser fallback), http, or browser."),
+    ] = "auto",
+    resolve_only: Annotated[
+        bool,
+        typer.Option("--resolve-only", help="Resolve domains only; do not crawl."),
+    ] = False,
+    deep_resolve: Annotated[
+        bool,
+        typer.Option("--deep-resolve", help="Try OLX offer pages when no shop subdomain exists."),
+    ] = False,
+) -> None:
+    """Resolve storefronts, extract company emails and context."""
+    if engine not in {"auto", "http", "browser"}:
+        console.print(f"[red]Unknown engine: {engine}[/] (use auto, http, or browser)")
+        raise typer.Exit(code=1)
+
+    stats = asyncio.run(
+        enrich_pending(
+            limit=limit,
+            source=source,
+            lead_id=lead_id,
+            force=force,
+            resolve_only=resolve_only,
+            deep_resolve=deep_resolve,
+            engine=engine,
+        )
+    )
+    _print_run_stats(stats, resolve_only=resolve_only)
+
+
+def _print_run_stats(stats: RunStats, *, resolve_only: bool) -> None:
+    table = Table(title="Enrichment summary")
+    table.add_column("metric")
+    table.add_column("value", justify="right")
+    rows = [
+        ("scanned", stats.scanned),
+        ("resolved", stats.resolved),
+        ("overridden", stats.overridden),
+        ("enriched", stats.enriched),
+        ("skipped", stats.skipped),
+        ("emails stored", stats.emails),
+        ("no site", stats.no_site),
+        ("no contact", stats.no_contact),
+        ("blocked", stats.blocked),
+        ("failed", stats.failed),
+        ("duplicates", stats.duplicates),
+        ("duration (s)", stats.duration_s),
+    ]
+    if resolve_only:
+        rows = [
+            ("scanned", stats.scanned),
+            ("resolved", stats.resolved),
+            ("overridden", stats.overridden),
+            ("unresolved", stats.no_site),
+            ("duplicates", stats.duplicates),
+            ("duration (s)", stats.duration_s),
+        ]
+    for name, value in rows:
+        table.add_row(name, str(value))
+    console.print(table)
+
+
+@app.command("contacts")
+def contacts(
+    limit: Annotated[int, typer.Option(help="Rows to show.")] = 50,
+    lead_id: Annotated[int | None, typer.Option(help="Filter by lead id.")] = None,
+) -> None:
+    """Show observed contacts that Phase 3 will use."""
+
+    async def main() -> None:
+        await init_db()
+        async with session_scope() as session:
+            rows = await EnrichmentRepo(session).list_contacts(limit=limit, lead_id=lead_id)
+
+        table = Table(title=f"Contacts ({len(rows)})")
+        for column in ("lead", "name", "email", "kind", "confidence", "source"):
+            table.add_column(column, overflow="fold")
+        for contact, lead in rows:
+            table.add_row(
+                str(lead.id),
+                lead.name,
+                contact.email,
+                contact.kind,
+                f"{contact.confidence:.2f}",
+                contact.source_url or "-",
+            )
         console.print(table)
 
     asyncio.run(main())

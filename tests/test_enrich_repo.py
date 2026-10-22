@@ -241,6 +241,7 @@ async def test_suppressed_email_and_domain_are_never_stored(db) -> None:
             other_id, _result(domain="b.pl", contacts=[_hit("kontakt@b.pl")])
         )
     assert outcome.stored_contacts == 0
+    assert outcome.lead_status == LeadStatusDB.SKIPPED
 
     async with session_scope() as session:
         stored = (await session.execute(select(Contact))).scalars().all()
