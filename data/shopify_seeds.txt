@@ -1,0 +1,50 @@
+# Shopify seed list: one store domain per line. '#' starts a comment.
+#
+# These were verified live: each returns a public /products.json feed.
+# Add your own targets freely — the source probes every line and silently
+# skips domains that are not Shopify stores.
+#
+# --- fashion / apparel
+bizuu.pl
+misbhv.pl
+lecollet.pl
+nago.com
+booso.pl
+theodderside.com
+kidstory.pl
+303avenue.pl
+magdabutrym.com
+kyosk.pl
+itsmilla.com
+nudyess.com
+thelovelovelife.com
+pelie.pl
+bebeconcept.pl
+# --- beauty / cosmetics / supplements
+glov.co
+nikalab.pl
+skyn.pl
+sorvellaperfume.pl
+phdoctorlab.pl
+yourkaya.pl
+mothersprotect.com
+cbdreakiro.com
+# --- home / interior / garden
+noo.ma
+oakywood.shop
+huush.pl
+eplafoniera.pl
+plantsforhumans.com
+# --- food / drink
+kawa.pl
+lyofood.pl
+ekogram.pl
+# --- books / stationery / hobby
+artrage.pl
+papierniczeni.pl
+keyshorts.com
+# --- sport / outdoor
+bieznie.pl
+adventuresports.pl
+# --- electronics / accessories
+genactiv.pl
