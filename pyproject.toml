@@ -43,6 +43,8 @@ filterwarnings = ["ignore::DeprecationWarning"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# The phase plan is documentation and must not be reformatted by the linter.
+extend-exclude = ["phase2.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]

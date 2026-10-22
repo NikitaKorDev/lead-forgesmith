@@ -38,6 +38,16 @@ class LeadStatusDB(StrEnum):
     SKIPPED = "skipped"
 
 
+class EnrichmentStatusDB(StrEnum):
+    """Terminal outcomes of one crawl. ``None`` means "resolved, not crawled"."""
+
+    OK = "ok"
+    NO_SITE = "no_site"
+    NO_CONTACT = "no_contact"
+    BLOCKED = "blocked"
+    ERROR = "error"
+
+
 class Lead(Base):
     __tablename__ = "leads"
     __table_args__ = (
@@ -67,9 +77,50 @@ class Lead(Base):
     contacts: Mapped[list[Contact]] = relationship(
         back_populates="lead", cascade="all, delete-orphan"
     )
+    enrichment: Mapped[Enrichment | None] = relationship(
+        back_populates="lead", uselist=False, cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<Lead {self.id} {self.source}:{self.source_id} {self.name!r}>"
+
+
+class Enrichment(Base):
+    """Enrichment state, kept out of ``Lead.raw`` (sources replace that wholesale)."""
+
+    __tablename__ = "enrichments"
+    __table_args__ = (UniqueConstraint("lead_id", name="uq_enrichments_lead_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    lead_id: Mapped[int] = mapped_column(
+        ForeignKey("leads.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    # None only while a --resolve-only row has not been crawled yet.
+    status: Mapped[str | None] = mapped_column(String(32))
+    domain: Mapped[str | None] = mapped_column(String(255))
+    domain_source: Mapped[str] = mapped_column(String(32), default="none", nullable=False)
+    site_url: Mapped[str | None] = mapped_column(String(2048))
+    storefront_platform: Mapped[str | None] = mapped_column(String(64))
+    legal_name: Mapped[str | None] = mapped_column(String(512))
+    nip: Mapped[str | None] = mapped_column(String(16))
+    description: Mapped[str | None] = mapped_column(Text)
+    context: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    evidence: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    engine: Mapped[str | None] = mapped_column(String(16))
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    lead: Mapped[Lead] = relationship(back_populates="enrichment")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<Enrichment lead={self.lead_id} status={self.status!r}>"
 
 
 class Contact(Base):

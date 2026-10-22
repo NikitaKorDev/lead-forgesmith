@@ -1,6 +1,8 @@
 from forgesmith.db.models import (
     Base,
     Contact,
+    Enrichment,
+    EnrichmentStatusDB,
     Event,
     Lead,
     LeadStatusDB,
@@ -8,7 +10,7 @@ from forgesmith.db.models import (
     Send,
     Suppression,
 )
-from forgesmith.db.repo import LeadRepo
+from forgesmith.db.repo import EnrichmentRepo, LeadRepo
 from forgesmith.db.session import (
     dispose_db,
     get_engine,
@@ -21,6 +23,9 @@ from forgesmith.db.session import (
 __all__ = [
     "Base",
     "Contact",
+    "Enrichment",
+    "EnrichmentRepo",
+    "EnrichmentStatusDB",
     "Event",
     "Lead",
     "LeadRepo",

@@ -42,6 +42,18 @@ class Settings(BaseSettings):
     olx_base_url: str = "https://www.olx.pl"
     olx_max_pages: int = 3
 
+    # --- enrichment (phase 2) --------------------------------------------
+    enrich_max_pages: int = Field(default=5, ge=1)
+    enrich_max_attempts: int = Field(default=3, ge=1)
+    enrich_lead_timeout: float = Field(default=60.0, gt=0)
+    enrich_page_timeout: float = Field(default=10.0, gt=0)
+    enrich_max_bytes: int = Field(default=2_000_000, gt=0)
+    enrich_text_chars: int = Field(default=3000, ge=0)
+    enrich_email_limit: int = Field(default=3, ge=1)
+    enrich_browser_settle_ms: int = Field(default=3000, ge=0)
+    enrich_respect_robots: bool = True
+    enrich_domain_overrides: Path = PROJECT_ROOT / "data" / "domain_overrides.csv"
+
     # --- llm (phase 3) ---------------------------------------------------
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5:7b"
