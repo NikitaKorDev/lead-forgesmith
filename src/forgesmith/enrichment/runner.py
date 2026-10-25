@@ -68,7 +68,7 @@ class EnrichmentRunner:
             )
             tracked = await LeadRepo(session).domains()
 
-        overrides = load_overrides(self.settings.enrich_domain_overrides)
+        overrides = load_overrides(self.settings.overrides_file)
         for lead in leads:
             stats.scanned += 1
             deadline = time.monotonic() + self.settings.enrich_lead_timeout

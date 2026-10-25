@@ -4,13 +4,18 @@ from forgesmith.db.models import (
     Enrichment,
     EnrichmentStatusDB,
     Event,
+    InboundKindDB,
+    InboundMessage,
+    InboundStatusDB,
     Lead,
     LeadStatusDB,
+    MailboxState,
     Message,
     Send,
     Suppression,
 )
-from forgesmith.db.repo import EnrichmentRepo, LeadRepo
+from forgesmith.db.repo import ComposeRepo, EnrichmentRepo, InboxRepo, LeadRepo, MailRepo
+from forgesmith.db.schema import ensure_schema
 from forgesmith.db.session import (
     dispose_db,
     get_engine,
@@ -22,18 +27,26 @@ from forgesmith.db.session import (
 
 __all__ = [
     "Base",
+    "ComposeRepo",
     "Contact",
     "Enrichment",
     "EnrichmentRepo",
     "EnrichmentStatusDB",
     "Event",
+    "InboundKindDB",
+    "InboundMessage",
+    "InboundStatusDB",
+    "InboxRepo",
     "Lead",
     "LeadRepo",
     "LeadStatusDB",
+    "MailRepo",
+    "MailboxState",
     "Message",
     "Send",
     "Suppression",
     "dispose_db",
+    "ensure_schema",
     "get_engine",
     "get_session_factory",
     "init_db",

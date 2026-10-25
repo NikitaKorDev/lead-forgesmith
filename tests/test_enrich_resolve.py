@@ -95,7 +95,7 @@ async def test_raw_external_url_is_not_a_resolution_branch() -> None:
 
 
 async def test_shop_subdomain_page_resolves_external_storefront() -> None:
-    shop_url = "https://regama.olx.pl"
+    shop_url = "https://regama.olx.pl/home/?tab=contact"
     shop = PageSnapshot(
         url=shop_url,
         final_url=shop_url,
@@ -110,6 +110,23 @@ async def test_shop_subdomain_page_resolves_external_storefront() -> None:
     assert resolved is not None
     assert (resolved.domain, resolved.source) == ("regama.pl", "shop_page")
     assert resolved.evidence["checked"] == shop_url
+
+
+def test_extract_external_domain_ignores_olx_corporate_footer() -> None:
+    html = """
+    <a href="https://www.olxgroup.com/">Grupa OLX</a>
+    <a href="https://www.otomoto.pl/">Otomoto</a>
+    <a href="https://www.obido.pl/">obido</a>
+    <a href="https://itunes.apple.com/pl/app/olx.pl">Aplikacja</a>
+    """
+    assert (
+        extract_external_domain(
+            html,
+            "https://proone.olx.pl/home/?tab=contact",
+            own_domain="olx.pl",
+        )
+        is None
+    )
 
 
 async def test_offer_page_only_used_with_deep_flag() -> None:

@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -16,9 +17,30 @@ from sqlalchemy.ext.asyncio import (
 from forgesmith.config import Settings
 from forgesmith.config import settings as default_settings
 from forgesmith.db.models import Base
+from forgesmith.db.schema import ensure_schema
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+
+
+def _sqlite_pragmas(engine: AsyncEngine, busy_timeout_ms: int) -> None:
+    """WAL plus a busy timeout so short concurrent writers queue instead of fail.
+
+    Phase 5 runs stages as separate one-shot containers; without WAL a second
+    writer hits ``database is locked`` immediately. ``busy_timeout`` makes the
+    second writer wait for the first short transaction.
+    """
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_pragmas(dbapi_connection, _record) -> None:  # pragma: no cover - driver hook
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
 
 
 def _ensure_parent_dir(url: str) -> None:
@@ -36,6 +58,8 @@ def get_engine(settings: Settings | None = None) -> AsyncEngine:
         cfg = settings or default_settings
         _ensure_parent_dir(cfg.database_url)
         _engine = create_async_engine(cfg.database_url, future=True)
+        if cfg.is_sqlite:
+            _sqlite_pragmas(_engine, cfg.db_busy_timeout_ms)
     return _engine
 
 
@@ -47,10 +71,16 @@ def get_session_factory(settings: Settings | None = None) -> async_sessionmaker[
 
 
 async def init_db(settings: Settings | None = None) -> None:
-    """Create tables if missing. Alembic takes over when we move to Postgres."""
+    """Create tables if missing, then complete additive schema pieces.
+
+    ``create_all`` does not alter existing tables, so the missing column and
+    indexes (including the one-live-attempt guard) are applied by
+    :func:`ensure_schema` on every init.
+    """
     engine = get_engine(settings)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await ensure_schema(engine)
 
 
 async def dispose_db() -> None:

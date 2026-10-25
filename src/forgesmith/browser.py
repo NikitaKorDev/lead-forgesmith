@@ -76,13 +76,19 @@ class BrowserFetcher:
                 ) from exc
 
             self._playwright = await async_playwright().start()
+            launch_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ]
+            if self.settings.browser_no_sandbox:
+                # Docker Desktop / WSL2 cannot create the Chromium sandbox
+                # namespaces. Enabled only by FORGESMITH_BROWSER_NO_SANDBOX so
+                # the host default stays sandboxed.
+                launch_args += ["--no-sandbox", "--disable-dev-shm-usage"]
             self._browser = await self._playwright.chromium.launch(
                 headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                ],
+                args=launch_args,
             )
             self._context = await self._browser.new_context(
                 locale="pl-PL",

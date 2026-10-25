@@ -1,14 +1,99 @@
+# Phase 5 topology. Every service is behind a profile, so a reflexive
+# `docker compose up -d` starts nothing.
+#
+#   docker compose --profile app run --rm -T app forgesmith db init
+#   docker compose --profile app run --rm -T app forgesmith status
+#   docker compose --profile browser run --rm -T app-browser forgesmith enrich
+#   docker compose --profile live run --rm -T app-live forgesmith send --live --yes
+#
+# SQLite and the mailer lock live on the named `fs-data` volume: virtiofs bind
+# mounts do not provide reliable flock() for the single-writer guard. Only the
+# operator-visible outbox/backups are bind-mounted.
+
+x-app: &app
+  image: forgesmith:${FORGESMITH_TAG:-latest}
+  build:
+    context: .
+    target: slim
+  profiles: ["app"]
+  env_file:
+    - .env
+  environment:
+    FORGESMITH_DATA_DIR: /app/data
+    FORGESMITH_DATABASE_URL: sqlite+aiosqlite:////app/data/forgesmith.db
+    FORGESMITH_OLLAMA_BASE_URL: ${FORGESMITH_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    FORGESMITH_LOG_JSON: ${FORGESMITH_LOG_JSON:-true}
+  init: true
+  user: "10001:10001"
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop: [ALL]
+  security_opt:
+    - "no-new-privileges:true"
+  volumes:
+    - fs-data:/app/data
+    - ./outbox:/app/data/outbox
+    - ./backups:/app/data/backups
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  restart: "no"
+
 services:
+  # Dry pipeline: source, enrich (HTTP), compose, approve, send (dry-run).
+  app:
+    <<: *app
+    profiles: ["app", "dry"]
+
+  # Live send. Requires .env.live (mail_dry_run=false) *and* the live profile
+  # *and* --live --yes; approve is never part of this service.
+  app-live:
+    <<: *app
+    profiles: ["live"]
+    env_file:
+      - .env
+      - .env.live
+
+  # Chromium for OLX and browser fallback during enrichment.
+  app-browser:
+    <<: *app
+    profiles: ["browser", "live-browser"]
+    image: forgesmith-browser:${FORGESMITH_TAG:-latest}
+    build:
+      context: .
+      target: browser
+    shm_size: 1gb
+    # Chromium crashpad/user-data needs a writable filesystem.
+    read_only: false
+    environment:
+      FORGESMITH_DATA_DIR: /app/data
+      FORGESMITH_DATABASE_URL: sqlite+aiosqlite:////app/data/forgesmith.db
+      FORGESMITH_OLLAMA_BASE_URL: ${FORGESMITH_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      FORGESMITH_LOG_JSON: ${FORGESMITH_LOG_JSON:-true}
+      FORGESMITH_BROWSER_NO_SANDBOX: "true"
+
+  # Optional co-located Ollama when the host binary is not used.
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["llm"]
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+
+  # Optional Postgres for branch hygiene / trying the portable schema path.
+  # Not the production database.
   db:
     image: postgres:16-alpine
+    profiles: ["tools"]
     environment:
       POSTGRES_USER: forgesmith
       POSTGRES_PASSWORD: forgesmith
       POSTGRES_DB: forgesmith
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pg-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U forgesmith -d forgesmith"]
       interval: 5s
@@ -17,11 +102,14 @@ services:
 
   adminer:
     image: adminer:latest
+    profiles: ["tools"]
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     depends_on:
       db:
         condition: service_healthy
 
 volumes:
-  pgdata:
+  fs-data:
+  ollama:
+  pg-data:

@@ -235,8 +235,9 @@ async def test_resolve_only_records_domain_without_touching_lead(db, monkeypatch
     )
     fetcher = FakeFetcher(
         {
-            "https://regama.olx.pl": snap(
-                "https://regama.olx.pl", '<a href="https://regama.pl">Strona www</a>'
+            "https://regama.olx.pl/home/?tab=contact": snap(
+                "https://regama.olx.pl/home/?tab=contact",
+                '<a href="https://regama.pl">Strona www</a>',
             )
         }
     )
@@ -285,14 +286,17 @@ async def test_resolve_only_reports_overrides_and_duplicates(db, monkeypatch, tm
     monkeypatch.setattr(settings, "enrich_domain_overrides", overrides)
     fetcher = FakeFetcher(
         {
-            "https://regama.olx.pl": snap(
-                "https://regama.olx.pl", '<a href="https://same.pl">Strona www</a>'
+            "https://regama.olx.pl/home/?tab=contact": snap(
+                "https://regama.olx.pl/home/?tab=contact",
+                '<a href="https://same.pl">Strona www</a>',
             ),
-            "https://regama2.olx.pl": snap(
-                "https://regama2.olx.pl", '<a href="https://same.pl">Strona www</a>'
+            "https://regama2.olx.pl/home/?tab=contact": snap(
+                "https://regama2.olx.pl/home/?tab=contact",
+                '<a href="https://same.pl">Strona www</a>',
             ),
-            "https://regama3.olx.pl": snap(
-                "https://regama3.olx.pl", '<a href="https://same.pl">Strona www</a>'
+            "https://regama3.olx.pl/home/?tab=contact": snap(
+                "https://regama3.olx.pl/home/?tab=contact",
+                '<a href="https://same.pl">Strona www</a>',
             ),
         }
     )
@@ -331,11 +335,13 @@ async def test_duplicate_resolved_domain_is_not_crawled_twice(db, monkeypatch) -
     )
     fetcher = FakeFetcher(
         {
-            "https://regama.olx.pl": snap(
-                "https://regama.olx.pl", '<a href="https://same.pl">Strona www</a>'
+            "https://regama.olx.pl/home/?tab=contact": snap(
+                "https://regama.olx.pl/home/?tab=contact",
+                '<a href="https://same.pl">Strona www</a>',
             ),
-            "https://regama2.olx.pl": snap(
-                "https://regama2.olx.pl", '<a href="https://same.pl">Strona www</a>'
+            "https://regama2.olx.pl/home/?tab=contact": snap(
+                "https://regama2.olx.pl/home/?tab=contact",
+                '<a href="https://same.pl">Strona www</a>',
             ),
             "https://same.pl/": snap(
                 "https://same.pl/",

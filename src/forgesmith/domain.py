@@ -190,6 +190,48 @@ def same_site(first: str, second: str) -> bool:
     return left is not None and left == right
 
 
+#: Free mailbox providers. A per-domain send guard must skip these: one Gmail
+#: prospect must not block every other Gmail prospect.
+FREEMAIL_DOMAINS: frozenset[str] = frozenset(
+    {
+        "gmail.com",
+        "googlemail.com",
+        "outlook.com",
+        "hotmail.com",
+        "live.com",
+        "yahoo.com",
+        "icloud.com",
+        "me.com",
+        "proton.me",
+        "protonmail.com",
+        "aol.com",
+        "gmx.com",
+        "mail.com",
+        "wp.pl",
+        "o2.pl",
+        "interia.pl",
+        "onet.pl",
+        "poczta.onet.pl",
+        "tlen.pl",
+        "op.pl",
+        "vp.pl",
+        "gazeta.pl",
+        "seznam.cz",
+        "mail.ru",
+        "yandex.ru",
+    }
+)
+
+
+def is_freemail(value: str | None) -> bool:
+    if not value:
+        return False
+    normalized = value.strip().lower()
+    return normalized in FREEMAIL_DOMAINS or (registrable_domain(normalized) or "") in (
+        FREEMAIL_DOMAINS
+    )
+
+
 class LeadCandidate(BaseModel):
     """A prospect as produced by a source, before any enrichment."""
 

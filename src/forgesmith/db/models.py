@@ -7,6 +7,7 @@ from enum import StrEnum
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     DateTime,
     ForeignKey,
     Index,
@@ -14,6 +15,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -142,6 +144,7 @@ class Message(Base):
     """A generated pitch. Kept even after sending for reply-rate analysis."""
 
     __tablename__ = "messages"
+    __table_args__ = (Index("ix_messages_lead_id", "lead_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     lead_id: Mapped[int] = mapped_column(ForeignKey("leads.id", ondelete="CASCADE"), nullable=False)
@@ -156,6 +159,20 @@ class Message(Base):
 
 class Send(Base):
     __tablename__ = "sends"
+    __table_args__ = (
+        Index("ix_sends_message_id", "message_id"),
+        Index("ix_sends_smtp_message_id", "smtp_message_id"),
+        # One live attempt per message. ``failed``/``aborted`` are excluded so
+        # they stay retryable; the partial index is the cross-process guard
+        # behind ``MailRepo.reserve``'s Python-side re-check.
+        Index(
+            "uq_sends_message_live",
+            "message_id",
+            unique=True,
+            sqlite_where=text("status IN ('pending','sent','uncertain','bounced')"),
+            postgresql_where=text("status IN ('pending','sent','uncertain','bounced')"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     message_id: Mapped[int] = mapped_column(ForeignKey("messages.id"), nullable=False)
@@ -164,6 +181,9 @@ class Send(Base):
     smtp_message_id: Mapped[str | None] = mapped_column(String(512))
     status: Mapped[str] = mapped_column(String(32), default="pending")
     error: Mapped[str | None] = mapped_column(Text)
+    # Physically nullable so the additive ``ALTER`` stays portable; the
+    # application always writes it (``ensure_schema`` completes old DBs).
+    created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=utcnow)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
@@ -184,6 +204,7 @@ class Event(Base):
     """Append-only audit trail: who changed what, when, and why."""
 
     __tablename__ = "events"
+    __table_args__ = (Index("ix_events_entity_action", "entity", "entity_id", "action"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     entity: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -191,3 +212,81 @@ class Event(Base):
     action: Mapped[str] = mapped_column(String(64), nullable=False)
     detail: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class InboundKindDB(StrEnum):
+    DSN = "dsn"
+    REPLY = "reply"
+    OPTOUT = "optout"
+    ARF = "arf"
+    MDN = "mdn"
+    AUTO = "auto"
+    OTHER = "other"
+
+
+class InboundStatusDB(StrEnum):
+    NEW = "new"
+    APPLIED = "applied"
+    NEEDS_REVIEW = "needs_review"
+    IGNORED = "ignored"
+    FAILED = "failed"
+
+
+class InboundMessage(Base):
+    """One observed mailbox message and the action it proposes.
+
+    The ledger is the durable record of what arrived; ``detail`` never stores
+    the body. IMAP UIDs are 32-bit unsigned, so both UID columns are
+    ``BigInteger`` (Postgres ``Integer`` is signed and would overflow).
+    """
+
+    __tablename__ = "inbound_messages"
+    __table_args__ = (
+        UniqueConstraint("mailbox", "dedupe_hash", name="uq_inbound_mailbox_dedupe"),
+        UniqueConstraint("mailbox", "uid_validity", "imap_uid", name="uq_inbound_mailbox_uid"),
+        Index("ix_inbound_messages_status", "status"),
+        Index("ix_inbound_messages_lead_id", "lead_id"),
+        Index("ix_inbound_messages_send_id", "send_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mailbox: Mapped[str] = mapped_column(String(255), nullable=False)
+    uid_validity: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    imap_uid: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Never NULL: unique indexes treat NULLs as distinct on SQLite and Postgres.
+    dedupe_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    rfc_message_id: Mapped[str | None] = mapped_column(String(512))
+    kind: Mapped[str] = mapped_column(String(16), default=InboundKindDB.OTHER, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default=InboundStatusDB.NEW, nullable=False)
+    from_addr: Mapped[str | None] = mapped_column(String(320))
+    to_addr: Mapped[str | None] = mapped_column(String(320))
+    final_recipient: Mapped[str | None] = mapped_column(String(320))
+    subject: Mapped[str | None] = mapped_column(String(512))
+    lead_id: Mapped[int | None] = mapped_column(ForeignKey("leads.id", ondelete="CASCADE"))
+    send_id: Mapped[int | None] = mapped_column(ForeignKey("sends.id", ondelete="SET NULL"))
+    reported_message_id: Mapped[str | None] = mapped_column(String(512))
+    enhanced_status: Mapped[str | None] = mapped_column(String(16))
+    smtp_code: Mapped[int | None] = mapped_column(Integer)
+    detail: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MailboxState(Base):
+    """Per-mailbox UID cursor. A table so the cursor joins the message commit."""
+
+    __tablename__ = "mailbox_state"
+    __table_args__ = (UniqueConstraint("mailbox", name="uq_mailbox_state_mailbox"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mailbox: Mapped[str] = mapped_column(String(255), nullable=False)
+    uid_validity: Mapped[int | None] = mapped_column(BigInteger)
+    last_uid: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )

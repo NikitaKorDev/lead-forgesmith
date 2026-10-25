@@ -5,7 +5,16 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .env
+.env.live
 data/*.db
 data/*.db-journal
+data/*.db-wal
+data/*.db-shm
 data/outbox/
+data/backups/
+outbox/*
+!outbox/.gitkeep
+backups/*
+!backups/.gitkeep
+state/
 logs/

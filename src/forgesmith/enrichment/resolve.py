@@ -24,6 +24,16 @@ log = structlog.get_logger(__name__)
 
 _BLOCKED_DOMAINS = {
     "olx.pl",
+    "olxgroup.com",
+    "olxcdn.com",
+    "olx.org",
+    "olx.bg",
+    "olx.ro",
+    "olx.ua",
+    "olx.pt",
+    "otodom.pl",
+    "otomoto.pl",
+    "obido.pl",
     "allegro.pl",
     "ceneo.pl",
     "facebook.com",
@@ -34,6 +44,7 @@ _BLOCKED_DOMAINS = {
     "x.com",
     "linkedin.com",
     "google.com",
+    "apple.com",
     "goo.gl",
     "linktr.ee",
     "bit.ly",
@@ -43,10 +54,14 @@ _BLOCKED_DOMAINS = {
 _BLOCKED_SUFFIXES = (
     ".olx.pl",
     ".olxstatic.com",
+    ".olxcdn.com",
+    ".olx.org",
+    ".olxgroup.com",
     ".facebook.com",
     ".instagram.com",
     ".google.com",
     ".gstatic.com",
+    ".apple.com",
     ".cloudfront.net",
     ".googleusercontent.com",
 )
@@ -154,7 +169,7 @@ async def resolve_domain(
     if isinstance(ad, dict):
         subdomain = ad.get("shop_subdomain")
         if isinstance(subdomain, str) and subdomain.strip():
-            shop_url = f"https://{subdomain.strip().removeprefix('www.')}.olx.pl"
+            shop_url = f"https://{subdomain.strip().removeprefix('www.')}.olx.pl/home/?tab=contact"
             snapshot = await fetcher.fetch(shop_url, deadline=deadline)
             if snapshot.ok:
                 domain = extract_external_domain(
