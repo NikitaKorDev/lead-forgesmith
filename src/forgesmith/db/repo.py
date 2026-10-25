@@ -28,6 +28,7 @@ from forgesmith.db.models import (
     utcnow,
 )
 from forgesmith.domain import LeadCandidate, UpsertStats, is_freemail, registrable_domain
+from forgesmith.eligibility import Eligibility, LeadState, evaluate
 from forgesmith.inbox.models import InboundKind, ParsedInbound, RawMessage
 from forgesmith.inbox.parse import canonical_message_id
 from forgesmith.mailer.models import (
@@ -92,6 +93,14 @@ class FinishOutcome:
     lead_status: str
     enrichment_status: str | None
     stored_contacts: int
+
+
+@dataclass(frozen=True, slots=True)
+class _LeadFacts:
+    """The two lead columns :func:`forgesmith.eligibility.evaluate` reads."""
+
+    status: str
+    domain: str | None
 
 
 class LeadRepo:
@@ -175,6 +184,50 @@ class LeadRepo:
         Ordering by failed ``compose_failed`` events keeps one poison lead from
         permanently occupying the front of the queue, mirroring Phase 2.
         """
+        stmt, order = self._composable_stmt(
+            source=source,
+            lead_id=lead_id,
+            regenerate=regenerate,
+            retry_failed=retry_failed,
+            max_attempts=max_attempts,
+        )
+        stmt = (
+            stmt.options(selectinload(Lead.contacts), selectinload(Lead.enrichment))
+            .order_by(*order)
+            .limit(limit)
+        )
+        return (await self.session.execute(stmt)).scalars().unique().all()
+
+    async def count_composable(
+        self,
+        *,
+        source: str | None = None,
+        lead_id: int | None = None,
+        regenerate: bool = False,
+        retry_failed: bool = False,
+        max_attempts: int = 3,
+    ) -> int:
+        """How many leads ``select_composable`` would return, without loading them."""
+        stmt, _ = self._composable_stmt(
+            source=source,
+            lead_id=lead_id,
+            regenerate=regenerate,
+            retry_failed=retry_failed,
+            max_attempts=max_attempts,
+        )
+        count = select(func.count()).select_from(stmt.subquery())
+        return int((await self.session.execute(count)).scalar_one())
+
+    def _composable_stmt(
+        self,
+        *,
+        source: str | None,
+        lead_id: int | None,
+        regenerate: bool,
+        retry_failed: bool,
+        max_attempts: int,
+    ) -> tuple[Any, tuple[Any, ...]]:
+        """The selection rule shared by the runner and the ``--check`` count."""
         failed = (
             select(Event.entity_id.label("lead_id"), func.count().label("failed_attempts"))
             .where(Event.entity == "lead", Event.action == "compose_failed")
@@ -207,8 +260,6 @@ class LeadRepo:
                     func.lower(Suppression.value) == func.lower(Lead.domain),
                 ),
             )
-            .options(selectinload(Lead.contacts), selectinload(Lead.enrichment))
-            .order_by(func.coalesce(failed.c.failed_attempts, 0), Lead.id)
         )
         if lead_id is not None:
             stmt = stmt.where(Lead.id == lead_id)
@@ -218,9 +269,116 @@ class LeadRepo:
             stmt = stmt.where(~exists().where(Message.lead_id == Lead.id))
         if not retry_failed:
             stmt = stmt.where(func.coalesce(failed.c.failed_attempts, 0) < max_attempts)
-        if limit is not None:
-            stmt = stmt.limit(limit)
-        return (await self.session.execute(stmt)).scalars().unique().all()
+        return stmt, (func.coalesce(failed.c.failed_attempts, 0), Lead.id)
+
+    async def eligibility_map(
+        self,
+        *,
+        lead_ids: Sequence[int] | None = None,
+        source: str | None = None,
+        compose_max_attempts: int = 3,
+        enrich_max_attempts: int = 3,
+        retry_failed: bool = False,
+    ) -> dict[int, Eligibility]:
+        """Classify leads with :func:`evaluate`, in five queries regardless of size.
+
+        ``leads --json``, ``compose --check`` and the GUI's stage strip all read
+        this, so a lead can never be "draftable" in one place and not another.
+        """
+        stmt = select(Lead.id, Lead.status, Lead.domain).order_by(Lead.id)
+        if source:
+            stmt = stmt.where(Lead.source == source)
+        if lead_ids is not None:
+            wanted = list(lead_ids)
+            if not wanted:
+                return {}
+            stmt = stmt.where(Lead.id.in_(wanted))
+        lead_rows = [(row[0], row[1], row[2]) for row in await self.session.execute(stmt)]
+        if not lead_rows:
+            return {}
+
+        role_contacts: dict[int, list[str]] = {}
+        for contact_lead, email in await self.session.execute(
+            select(Contact.lead_id, Contact.email).where(Contact.kind == "role")
+        ):
+            role_contacts.setdefault(contact_lead, []).append(email)
+
+        enrichment_status = {
+            lead_id: status
+            for lead_id, status in await self.session.execute(
+                select(Enrichment.lead_id, Enrichment.status)
+            )
+        }
+        enrichment_attempts = {
+            lead_id: int(attempts or 0)
+            for lead_id, attempts in await self.session.execute(
+                select(Enrichment.lead_id, Enrichment.attempts)
+            )
+        }
+        with_message = set(
+            (await self.session.execute(select(Message.lead_id).distinct())).scalars()
+        )
+        compose_failures = {
+            int(entity_id): int(count)
+            for entity_id, count in await self.session.execute(
+                select(Event.entity_id, func.count())
+                .where(Event.entity == "lead", Event.action == "compose_failed")
+                .group_by(Event.entity_id)
+            )
+        }
+        suppressions = await EnrichmentRepo(self.session).load_suppressions()
+
+        result: dict[int, Eligibility] = {}
+        for lead_id, status, domain in lead_rows:
+            result[lead_id] = evaluate(
+                _LeadFacts(status=str(status or ""), domain=domain),
+                has_message=lead_id in with_message,
+                role_contacts=role_contacts.get(lead_id, ()),
+                suppressed_emails=suppressions.emails,
+                suppressed_domains=suppressions.domains,
+                enrichment_status=enrichment_status.get(lead_id),
+                compose_attempts=compose_failures.get(lead_id, 0),
+                compose_max_attempts=compose_max_attempts,
+                enrich_attempts=enrichment_attempts.get(lead_id, 0),
+                enrich_max_attempts=enrich_max_attempts,
+                retry_failed=retry_failed,
+            )
+        return result
+
+    async def funnel(
+        self,
+        *,
+        compose_max_attempts: int = 3,
+        enrich_max_attempts: int = 3,
+    ) -> dict[str, int]:
+        """Counts for the stage strip: how much work waits at each step."""
+        eligibility = await self.eligibility_map(
+            compose_max_attempts=compose_max_attempts,
+            enrich_max_attempts=enrich_max_attempts,
+        )
+        total = len(eligibility)
+        with_domain = int(
+            (
+                await self.session.execute(
+                    select(func.count()).select_from(Lead).where(Lead.domain.is_not(None))
+                )
+            ).scalar_one()
+        )
+        states: dict[str, int] = {}
+        for item in eligibility.values():
+            states[str(item.state)] = states.get(str(item.state), 0) + 1
+        return {
+            "collected": total,
+            "with_domain": with_domain,
+            "domainless": total - with_domain,
+            "enrichable": states.get(LeadState.COLLECTED, 0)
+            + states.get(LeadState.READY_TO_ENRICH, 0),
+            "composable": states.get(LeadState.READY_TO_DRAFT, 0),
+            "drafted": states.get(LeadState.DRAFTED, 0),
+            "approved": states.get(LeadState.APPROVED, 0),
+            "parked": states.get(LeadState.PARKED, 0),
+            "done": states.get(LeadState.DONE, 0),
+        }
 
     async def domains(self) -> dict[str, int]:
         """Map every non-null domain to its lead id (for duplicate detection)."""
@@ -1844,6 +2002,10 @@ class InboxRepo(MailRepo):
         if statuses:
             stmt = stmt.where(InboundMessage.status.in_(statuses))
         return list((await self.session.execute(stmt)).scalars())
+
+    async def inbound_status_counts(self) -> dict[str, int]:
+        stmt = select(InboundMessage.status, func.count()).group_by(InboundMessage.status)
+        return {str(status): int(count) for status, count in await self.session.execute(stmt)}
 
     async def get_inbound(self, inbound_id: int) -> InboundMessage | None:
         return await self.session.get(InboundMessage, inbound_id)

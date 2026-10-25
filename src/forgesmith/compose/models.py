@@ -9,6 +9,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 @dataclass(slots=True)
+class ComposeOutcome:
+    """What happened to one lead in a compose run."""
+
+    lead_id: int
+    outcome: str  # drafted | skipped | failed
+    reason: str | None = None
+
+
+@dataclass(slots=True)
 class ComposeStats:
     """Counters for one compose run; printed as the final CLI summary."""
 
@@ -17,6 +26,7 @@ class ComposeStats:
     drafted: int = 0
     failed: int = 0
     duration_s: float = 0.0
+    outcomes: list[ComposeOutcome] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)

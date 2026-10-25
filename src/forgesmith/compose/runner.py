@@ -14,6 +14,7 @@ from forgesmith.compose.context import (
 from forgesmith.compose.llm import LLMClient, OllamaClient
 from forgesmith.compose.models import (
     ComposeError,
+    ComposeOutcome,
     ComposeStats,
     DraftParseError,
     DraftPayload,
@@ -96,6 +97,9 @@ class ComposeRunner:
                     errors=[],
                 )
                 stats.failed += 1
+                stats.outcomes.append(
+                    ComposeOutcome(lead.id, "failed", f"exception:{type(exc).__name__}")
+                )
 
         stats.duration_s = round(time.monotonic() - started, 2)
         return stats
@@ -112,6 +116,7 @@ class ComposeRunner:
         if contact is None:
             await self._record_skip(lead.id, "no_role_contact")
             stats.skipped += 1
+            stats.outcomes.append(ComposeOutcome(lead.id, "skipped", "no_role_contact"))
             return
 
         payload = build_fact_payload(
@@ -125,6 +130,7 @@ class ComposeRunner:
         ):
             await self._record_skip(lead.id, "insufficient_context")
             stats.skipped += 1
+            stats.outcomes.append(ComposeOutcome(lead.id, "skipped", "insufficient_context"))
             return
 
         system, user = build_prompt(payload, sender)
@@ -148,6 +154,7 @@ class ComposeRunner:
                 context_hash=ctx_hash,
             )
             stats.failed += 1
+            stats.outcomes.append(ComposeOutcome(lead.id, "failed", str(exc)))
             return
         except _DraftRejected as exc:
             await self._record_failure(
@@ -159,6 +166,7 @@ class ComposeRunner:
                 context_hash=ctx_hash,
             )
             stats.failed += 1
+            stats.outcomes.append(ComposeOutcome(lead.id, "failed", "validation_failed"))
             return
 
         try:
@@ -172,6 +180,7 @@ class ComposeRunner:
                 context_hash=ctx_hash,
             )
             stats.failed += 1
+            stats.outcomes.append(ComposeOutcome(lead.id, "failed", "footer_count"))
             return
 
         hooks = {
@@ -191,6 +200,7 @@ class ComposeRunner:
                 hooks=hooks,
             )
         stats.drafted += 1
+        stats.outcomes.append(ComposeOutcome(lead.id, "drafted"))
 
     async def _generate(
         self,

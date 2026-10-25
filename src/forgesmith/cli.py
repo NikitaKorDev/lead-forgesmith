@@ -8,15 +8,18 @@ import json as jsonlib
 import os
 import shutil
 import signal
+import socket
 import sqlite3
 import sys
 import tarfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, TypeVar
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -42,6 +45,7 @@ from forgesmith.db import (
 )
 from forgesmith.db.models import Event
 from forgesmith.domain import LeadCandidate, UpsertStats
+from forgesmith.eligibility import LeadState, reason_for_skip
 from forgesmith.enrichment import RunStats, enrich_pending
 from forgesmith.http import PoliteClient
 from forgesmith.inbox.models import InboundKind, InboundStatus, InboxConfigError, InboxError
@@ -315,21 +319,32 @@ def leads(
             repo = LeadRepo(session)
             rows = await repo.list(limit=limit, status=status, source=source)
             total = await repo.count()
-            payload = [
-                {
-                    "id": lead.id,
-                    "source": lead.source,
-                    "name": lead.name,
-                    "domain": lead.domain,
-                    "city": lead.city,
-                    "category": lead.category,
-                    "status": lead.status,
-                    "platform": lead.platform,
-                    "phone": lead.phone,
-                    "url": lead.url,
-                }
-                for lead in rows
-            ]
+            eligibility = await repo.eligibility_map(
+                lead_ids=[lead.id for lead in rows],
+                compose_max_attempts=settings.compose_max_attempts,
+                enrich_max_attempts=settings.enrich_max_attempts,
+            )
+            payload = []
+            for lead in rows:
+                next_step = eligibility.get(lead.id)
+                payload.append(
+                    {
+                        "id": lead.id,
+                        "source": lead.source,
+                        "name": lead.name,
+                        "domain": lead.domain,
+                        "city": lead.city,
+                        "category": lead.category,
+                        "status": lead.status,
+                        "platform": lead.platform,
+                        "phone": lead.phone,
+                        "url": lead.url,
+                        "state": str(next_step.state) if next_step else None,
+                        "next_action": next_step.action if next_step else None,
+                        "action_label": next_step.label if next_step else None,
+                        "reason": next_step.reason if next_step else None,
+                    }
+                )
         return payload, total
 
     rows, total = asyncio.run(main())
@@ -406,6 +421,7 @@ def enrich(
         bool,
         typer.Option("--deep-resolve", help="Try OLX offer pages when no shop subdomain exists."),
     ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
 ) -> None:
     """Resolve storefronts, extract company emails and context."""
     if engine not in {"auto", "http", "browser"}:
@@ -425,6 +441,9 @@ def enrich(
             )
 
     stats = asyncio.run(_run())
+    if json_output:
+        print(jsonlib.dumps(asdict(stats), ensure_ascii=False, indent=2, default=str))
+        return
     _print_run_stats(stats, resolve_only=resolve_only)
 
 
@@ -526,8 +545,32 @@ def compose(
         bool,
         typer.Option("--retry-failed", help="Retry leads that reached the failed-attempt cap."),
     ] = False,
+    check: Annotated[
+        bool,
+        typer.Option(
+            "--check",
+            help="Report what would be drafted; no Ollama call and no writes.",
+        ),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
 ) -> None:
     """Generate grounded Polish drafts for enriched leads."""
+    if check:
+        report = asyncio.run(
+            _compose_check(
+                limit=limit,
+                source=source,
+                lead_id=lead_id,
+                regenerate=regenerate,
+                retry_failed=retry_failed,
+            )
+        )
+        if json_output:
+            print(jsonlib.dumps(report, ensure_ascii=False, indent=2, default=str))
+            return
+        _print_compose_check(report)
+        return
+
     try:
 
         async def _run() -> ComposeStats:
@@ -544,7 +587,183 @@ def compose(
     except ComposeConfigError as exc:
         console.print(f"[red]Compose is not configured:[/] {exc}")
         raise typer.Exit(code=1) from exc
+
+    note: str | None = None
+    if stats.scanned == 0:
+        # A scheduled compose on a quiet night must not look like a failure, so
+        # the exit code stays 0 -- but "scanned 0" on its own is useless. Say
+        # exactly which rule rejected the lead(s).
+        note = asyncio.run(
+            _compose_no_op_note(
+                lead_id=lead_id,
+                source=source,
+                regenerate=regenerate,
+                retry_failed=retry_failed,
+            )
+        )
+
+    if json_output:
+        payload = {
+            "scanned": stats.scanned,
+            "skipped": stats.skipped,
+            "drafted": stats.drafted,
+            "failed": stats.failed,
+            "duration_s": stats.duration_s,
+            "reason": note,
+            "outcomes": [
+                {"lead_id": item.lead_id, "outcome": item.outcome, "reason": item.reason}
+                for item in stats.outcomes
+            ],
+        }
+        print(jsonlib.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        return
+
     _print_compose_stats(stats)
+    if note:
+        console.print(f"[yellow]Nothing to draft[/] — {note}")
+
+
+async def _compose_check(
+    *,
+    limit: int | None,
+    source: str | None,
+    lead_id: int | None,
+    regenerate: bool,
+    retry_failed: bool,
+) -> dict[str, object]:
+    """Eligibility report shared by the GUI's Draft buttons and ``--check``."""
+    await init_db()
+    async with session_scope() as session:
+        repo = LeadRepo(session)
+        eligible = await repo.count_composable(
+            source=source,
+            lead_id=lead_id,
+            regenerate=regenerate,
+            retry_failed=retry_failed,
+            max_attempts=settings.compose_max_attempts,
+        )
+        if lead_id is not None:
+            checked_ids = [lead_id]
+        else:
+            checked_ids = [
+                lead.id
+                for lead in await repo.select_composable(
+                    limit=limit,
+                    source=source,
+                    regenerate=regenerate,
+                    retry_failed=retry_failed,
+                    max_attempts=settings.compose_max_attempts,
+                )
+            ]
+        classification = await repo.eligibility_map(
+            lead_ids=checked_ids,
+            compose_max_attempts=settings.compose_max_attempts,
+            enrich_max_attempts=settings.enrich_max_attempts,
+            retry_failed=retry_failed,
+        )
+    rows = []
+    for candidate in sorted(checked_ids):
+        item = classification.get(candidate)
+        rows.append(
+            {
+                "lead_id": candidate,
+                "state": str(item.state) if item else "missing",
+                "next_action": item.action if item else None,
+                "reason": item.reason if item else "lead does not exist",
+                "eligible": candidate in classification
+                and (
+                    item.state == LeadState.READY_TO_DRAFT
+                    or (regenerate and item.state == LeadState.DRAFTED)
+                ),
+            }
+        )
+    return {
+        "eligible": eligible,
+        "checked": len(checked_ids),
+        "lead_id": lead_id,
+        "regenerate": regenerate,
+        "leads": rows,
+    }
+
+
+def _print_compose_check(report: dict[str, object]) -> None:
+    rows = report.get("leads") or []
+    assert isinstance(rows, list)
+    eligible = int(report["eligible"] or 0)
+    lead_id = report.get("lead_id")
+    if lead_id is not None:
+        row = rows[0] if rows else {}
+        assert isinstance(row, dict)
+        verdict = "eligible" if row.get("eligible") else "not eligible"
+        console.print(
+            f"[{'green' if row.get('eligible') else 'yellow'}]{verdict}[/] "
+            f"lead {lead_id} ({row.get('state')}): {row.get('reason')}"
+        )
+        return
+    table = Table(title=f"Compose check: {eligible} eligible, {len(rows)} checked")
+    for column in ("lead", "state", "next", "reason"):
+        table.add_column(column, overflow="fold")
+    for row in rows:
+        assert isinstance(row, dict)
+        table.add_row(
+            str(row["lead_id"]),
+            str(row["state"]),
+            str(row["next_action"] or "-"),
+            str(row["reason"] or "-"),
+        )
+    console.print(table)
+
+
+async def _compose_no_op_note(
+    *,
+    lead_id: int | None,
+    source: str | None,
+    regenerate: bool,
+    retry_failed: bool,
+) -> str:
+    """Explain why a compose run selected nothing."""
+    await init_db()
+    async with session_scope() as session:
+        repo = LeadRepo(session)
+        if lead_id is not None:
+            classification = await repo.eligibility_map(
+                lead_ids=[lead_id],
+                compose_max_attempts=settings.compose_max_attempts,
+                enrich_max_attempts=settings.enrich_max_attempts,
+                retry_failed=retry_failed,
+            )
+            return reason_for_skip(
+                lead_id=lead_id,
+                found=lead_id in classification,
+                eligibility=classification.get(lead_id),
+                regenerate=regenerate,
+            )
+        classification = await repo.eligibility_map(
+            compose_max_attempts=settings.compose_max_attempts,
+            enrich_max_attempts=settings.enrich_max_attempts,
+            retry_failed=retry_failed,
+            source=source,
+        )
+    counts: dict[str, int] = {}
+    for item in classification.values():
+        counts[str(item.state)] = counts.get(str(item.state), 0) + 1
+    if not counts:
+        return "no leads are stored yet — run `forgesmith source` first"
+    scope = f" for source {source}" if source else ""
+    groups = (
+        ("not enriched yet", (LeadState.COLLECTED, LeadState.READY_TO_ENRICH)),
+        ("already drafted", (LeadState.DRAFTED,)),
+        ("already approved", (LeadState.APPROVED,)),
+        ("parked", (LeadState.PARKED,)),
+        ("finished", (LeadState.DONE,)),
+        ("ready to draft", (LeadState.READY_TO_DRAFT,)),
+    )
+    parts = []
+    for label, states in groups:
+        count = sum(counts.get(str(state), 0) for state in states)
+        if count:
+            parts.append(f"{count} {label}")
+    return f"no lead is ready to draft{scope}: " + ", ".join(parts)
 
 
 def _print_compose_stats(stats: ComposeStats) -> None:
@@ -707,6 +926,7 @@ def approve(
     ] = None,
     limit: Annotated[int | None, typer.Option(help="Max leads in a bulk run.")] = None,
     yes: Annotated[bool, typer.Option("--yes", help="Skip the bulk confirmation.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
 ) -> None:
     """Approve the latest draft: composed -> queued."""
     if settings.approval_channel.strip().lower() == "unattended":
@@ -742,6 +962,23 @@ def approve(
                     console.print(f"[red]Refused[/] lead {lead_id}: {exc.reason}")
                     raise typer.Exit(code=2) from exc
             state = "already approved" if already else "approved"
+            if json_output:
+                print(
+                    jsonlib.dumps(
+                        {
+                            "lead_id": lead_id,
+                            "message_id": message.id,
+                            "approved": not already,
+                            "already": already,
+                            "approved_count": 0 if already else 1,
+                            "refused": 0,
+                            "skipped": 0,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                return
             console.print(f"[green]{state.capitalize()}[/] lead {lead_id}, message {message.id}")
             return
 
@@ -760,10 +997,12 @@ def approve(
         for candidate, message in preview:
             created = message.created_at.strftime("%Y-%m-%d %H:%M") if message.created_at else "-"
             table.add_row(str(candidate), str(message.id), message.subject, created)
-        console.print(table)
+        if not json_output:
+            console.print(table)
         _confirm_bulk(len(ids), yes, "Bulk approve")
 
         approved = already = refused = 0
+        refused_leads: list[dict[str, object]] = []
         for candidate, message in preview:
             async with session_scope() as session:
                 try:
@@ -776,13 +1015,39 @@ def approve(
                     )
                 except ApprovalRefused as exc:
                     refused += 1
-                    console.print(f"[yellow]refused[/] lead {candidate}: {exc.reason}")
+                    refused_leads.append({"lead_id": candidate, "reason": exc.reason})
+                    if not json_output:
+                        console.print(f"[yellow]refused[/] lead {candidate}: {exc.reason}")
                     continue
             if was_already:
                 already += 1
             else:
                 approved += 1
         skipped = max(0, len(ids) - len(preview))
+        if json_output:
+            print(
+                jsonlib.dumps(
+                    {
+                        "lead_id": None,
+                        "approved_count": approved,
+                        "already": already,
+                        "refused": refused,
+                        "skipped": skipped,
+                        "refused_leads": refused_leads,
+                        "preview": [
+                            {
+                                "lead_id": candidate,
+                                "message_id": message.id,
+                                "subject": message.subject,
+                            }
+                            for candidate, message in preview
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return
         console.print(
             f"[green]approved {approved}[/], already {already}, "
             f"refused {refused}, skipped {skipped}"
@@ -836,6 +1101,7 @@ def send(
             help="Wall-clock budget in seconds (0/default: FORGESMITH_SEND_MAX_RUNTIME).",
         ),
     ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
 ) -> None:
     """Render dry-run .eml files, or deliver approved messages with --live."""
     _require_sender()
@@ -894,6 +1160,16 @@ def send(
                 signal.signal(signal.SIGTERM, previous_handler)
             except (ValueError, AttributeError, OSError):
                 pass
+    if json_output:
+        print(
+            jsonlib.dumps(
+                {**asdict(stats), "live": live, "kill_switch": settings.mail_dry_run},
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        )
+        return
     if stats.stop_reason == "kill_switch":
         console.print(
             "[yellow]Kill switch armed[/] (FORGESMITH_MAIL_DRY_RUN=true); "
@@ -1174,6 +1450,76 @@ def _window_state() -> dict[str, object]:
     }
 
 
+def _ollama_state() -> dict[str, object]:
+    """TCP probe of the Ollama daemon.
+
+    A connect is enough to answer "is the Draft stage usable"; it costs a few
+    milliseconds when the daemon is up and fails immediately on localhost when
+    it is not. No HTTP call, so no model is loaded and nothing is logged.
+    """
+    parsed = urlparse(settings.ollama_base_url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 11434
+    state: dict[str, object] = {
+        "url": settings.ollama_base_url,
+        "model": settings.ollama_model,
+    }
+    try:
+        with socket.create_connection((host, port), timeout=0.3):
+            state["reachable"] = True
+    except OSError as exc:
+        state["reachable"] = False
+        state["error"] = type(exc).__name__
+    return state
+
+
+def _blockers(window: dict[str, object]) -> dict[str, dict[str, object]]:
+    """What currently stops a stage from doing anything, with the reason.
+
+    The GUI renders these on the page that owns them instead of leaving the
+    operator to discover a closed window or a stopped Ollama by watching a run
+    do nothing.
+    """
+    armed = bool(settings.mail_dry_run)
+    window_open = window.get("open")
+    if window_open is True:
+        window_detail = f"open until {settings.mail_window_end}:00 {settings.mail_window_tz}"
+    elif window_open is False:
+        window_detail = f"closed; opens {window.get('next_opening') or 'later'}"
+    else:
+        window_detail = str(window.get("error") or "window configuration is invalid")
+
+    sender_blocked = False
+    sender_detail = "sender identity is configured"
+    try:
+        SenderProfile.from_settings(settings)
+    except ComposeConfigError as exc:
+        sender_blocked = True
+        sender_detail = str(exc)
+
+    ollama = _ollama_state()
+    ollama_blocked = not ollama["reachable"]
+    ollama_detail = (
+        f"Ollama answers at {ollama['url']} (model {ollama['model']})"
+        if not ollama_blocked
+        else f"Ollama is not listening at {ollama['url']} — start it before drafting"
+    )
+
+    return {
+        "kill_switch": {
+            "blocked": armed,
+            "detail": (
+                "kill switch armed (FORGESMITH_MAIL_DRY_RUN=true): live send is disabled"
+                if armed
+                else "kill switch off: live send is allowed"
+            ),
+        },
+        "window": {"blocked": window_open is not True, "detail": window_detail},
+        "ollama": {"blocked": ollama_blocked, "detail": ollama_detail},
+        "sender": {"blocked": sender_blocked, "detail": sender_detail},
+    }
+
+
 def _run_summary(latest: dict[str, Event]) -> dict[str, dict[str, object]]:
     summary: dict[str, dict[str, object]] = {}
     for stage, event in latest.items():
@@ -1200,12 +1546,22 @@ def status(
         async with session_scope() as session:
             leads = LeadRepo(session)
             mail = MailRepo(session)
+            inbox = InboxRepo(session)
+            window = _window_state()
+            funnel = await leads.funnel(
+                compose_max_attempts=settings.compose_max_attempts,
+                enrich_max_attempts=settings.enrich_max_attempts,
+            )
+            inbox_counts = await inbox.inbound_status_counts()
             payload: dict[str, object] = {
                 "database": settings.database_url,
                 "data_dir": str(settings.data_dir),
                 "kill_switch": "armed" if settings.mail_dry_run else "off",
                 "approval_channel": settings.approval_channel or "interactive",
-                "window": _window_state(),
+                "window": window,
+                "blockers": _blockers(window),
+                "funnel": funnel,
+                "inbox": inbox_counts,
                 "leads": {
                     "total": await leads.count(),
                     "by_status": await leads.status_counts(),
@@ -1240,7 +1596,22 @@ def status(
         "window",
         f"{'open' if window.get('open') else 'closed'} (next {window.get('next_opening', '-')})",
     )
+    funnel = payload.get("funnel") or {}
+    assert isinstance(funnel, dict)
     table.add_row("leads", str(leads.get("total")))
+    for label, key in (
+        ("collect", "collected"),
+        ("awaiting enrich", "enrichable"),
+        ("ready to draft", "composable"),
+        ("drafted", "drafted"),
+        ("approved", "approved"),
+        ("parked", "parked"),
+        ("domainless", "domainless"),
+    ):
+        table.add_row(f"  funnel: {label}", str(funnel.get(key, 0)))
+    inbox = payload.get("inbox") or {}
+    assert isinstance(inbox, dict)
+    table.add_row("  inbox: needs review", str(inbox.get("needs_review", 0)))
     for name, count in sorted(
         dict(leads.get("by_status") or {}).items(), key=lambda item: -int(item[1])
     ):
@@ -1255,6 +1626,14 @@ def status(
     outbox = payload["outbox"]
     assert isinstance(outbox, dict)
     table.add_row("outbox", f"{outbox.get('files')} files, {outbox.get('bytes')} bytes")
+    blockers = payload.get("blockers") or {}
+    assert isinstance(blockers, dict)
+    for name, info in blockers.items():
+        assert isinstance(info, dict)
+        table.add_row(
+            f"blocker: {name}",
+            ("BLOCKED " if info.get("blocked") else "ok ") + str(info.get("detail") or ""),
+        )
     runs = payload["runs"]
     assert isinstance(runs, dict)
     for stage, info in runs.items():
