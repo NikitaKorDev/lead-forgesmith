@@ -7,9 +7,9 @@ send it at a human pace.
 Status: **Phases 0–5 implemented** — scaffold, Shopify/OLX extraction,
 storefront enrichment (domain resolution, contact emails, business context),
 grounded Polish pitch generation, an approval-gated SMTP mailer with dry-run
-`.eml` output, read-only IMAP ingest for bounces and replies (Phase 4.5), and
-one-shot Docker packaging driven by Windows Task Scheduler. See
-[Roadmap](#roadmap).
+`.eml` output, read-only IMAP ingest for bounces and replies (Phase 4.5),
+one-shot Docker packaging driven by Windows Task Scheduler, and a PyQt5 desktop
+console over the same CLI. See [Roadmap](#roadmap).
 
 ## Quick start
 
@@ -36,6 +36,49 @@ uv run forgesmith doctor                     # pre-flight checks (exit 1 fail, 3
 For the unattended/container deployment, see
 [Containers and scheduling](#containers-and-scheduling) and
 [`ops/README.md`](ops/README.md).
+
+## Desktop console (PyQt5)
+
+The CLI has a companion desktop app that exposes every stage, ledger and status
+in one window. It is a thin front end: each button builds the same argv you would
+type and runs it as a one-shot `python -m forgesmith` subprocess, so approvals,
+the kill switch, dry-run gating, locks and the run ledger behave exactly as they
+do on the command line. The GUI never re-implements pipeline logic.
+
+```powershell
+uv sync --extra gui          # PyQt5 is an optional extra; the pipeline stays headless
+uv run forgesmith-gui        # or: uv run python -m forgesmith.gui
+```
+
+| Page | What it does |
+|---|---|
+| Dashboard | `status` + `doctor` cards, doctor checks, run ledger, 30 s auto-refresh |
+| Prospects | `leads` and `contacts` tables; jump to enrich/compose/approve/mark for a row |
+| Drafts | `drafts` with the full body beside the table; approve, unapprove, suppress, copy |
+| Sources | `source shopify`, `source olx` |
+| Enrichment | `enrich` (including `--resolve-only` and `--deep-resolve`) |
+| Compose | `compose` with a link straight to review |
+| Mailer | `send` (dry run or `--live`), live policy line from `status` |
+| Ledger | `sends` + `outbox`, open an `.eml`, resolve an uncertain attempt |
+| Inbox | `inbox sync`, `inbox list`, `inbox show`, `inbox apply` |
+| Operations | `db init`, `doctor`, `backup`, `mark`, `suppress`, `unsuppress`, `stats`, `version` |
+
+Notes that matter in practice:
+
+- **Confirmation is the modal.** A subprocess has no TTY, so the app appends
+  `--yes` for bulk commands; the warning dialog in front of you *is* the human
+  approval. `send --live` additionally shows a red LIVE banner and its own
+  dialog, and still needs `FORGESMITH_MAIL_DRY_RUN=false`.
+- **One stage at a time.** The runner owns a single process; **Stop** kills it
+  (SIGTERM/Kill) and the CLI's own stop handling still runs.
+- **`--json` is the contract.** Read-only commands accept `--json`; the GUI
+  renders those payloads and buffers the raw JSON out of the console. stderr
+  still streams, so warnings and tracebacks stay visible.
+- **Settings come from the repo root.** `.env` is read from the project
+  directory, not from wherever you launched the app, and stages run with that
+  directory as their working directory.
+- Tables sort by real values (ids sort `9 < 51`), and every page refreshes on
+  show once the runner is free.
 
 ## Commands
 
@@ -394,6 +437,13 @@ runs on a temporary SQLite file. Deployment assets are checked structurally
 Live Ollama generation, a live SMTP smoke and `docker build` are manual and
 not part of the default gate.
 
+The desktop console is covered without a display server: `tests/test_gui_commands.py`
+checks argv building, confirmations and the JSON payload helpers, and walks the
+Typer app so a renamed CLI flag cannot leave a dead button behind.
+`tests/test_gui_smoke.py` builds the real window under `QT_QPA_PLATFORM=offscreen`
+with the runner stubbed, and asserts every command is reachable and that JSON
+runs stay out of the console. Both skip cleanly when the `gui` extra is absent.
+
 ## Roadmap
 
 | Phase | Scope | State |
@@ -405,6 +455,7 @@ not part of the default gate.
 | 4 | Mailer: approval (`queued`), dry-run `.eml`, SMTP with caps/jitter/backoff, manual bounce/reply marking | done |
 | 4.5 | IMAP ingest: DSN bounces, reply/opt-out detection, automatic suppression | done |
 | 5 | Docker packaging, one-shot containers, SQLite on a named volume, Task Scheduler + ops runbook | done |
+| 6 | Desktop console (PyQt5) over the same CLI: every stage, ledger and status in one window | done |
 
 ### Legal / deliverability notes
 

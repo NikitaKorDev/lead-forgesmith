@@ -26,8 +26,19 @@ dev = [
     "ruff>=0.17.1",
 ]
 
+[project.optional-dependencies]
+# Desktop console. Optional so the pipeline stays headless by default:
+#   uv sync --extra gui && uv run forgesmith-gui
+gui = [
+    "PyQt5>=5.15.11",
+    # Riverbank ships no Windows Qt binaries after 5.15.2, and the resolver
+    # otherwise picks a manylinux-only PyQt5-Qt5 and fails on win_amd64.
+    "PyQt5-Qt5==5.15.2; sys_platform == 'win32'",
+]
+
 [project.scripts]
 forgesmith = "forgesmith.cli:app"
+forgesmith-gui = "forgesmith.gui:main"
 
 [build-system]
 requires = ["hatchling"]
