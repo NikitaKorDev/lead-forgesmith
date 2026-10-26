@@ -31,6 +31,7 @@ class LeadState(StrEnum):
     DRAFTED = "drafted"  # a draft exists, awaiting review
     APPROVED = "approved"  # queued: eligible for the next send
     PARKED = "parked"  # skipped, or nothing usable was found
+    BLOCKED = "blocked"  # sendable in principle, refused by the country gate
     DONE = "done"  # sent / replied / bounced / suppressed
 
 
@@ -42,6 +43,7 @@ STATE_LABELS: dict[str, str] = {
     LeadState.DRAFTED: "drafted",
     LeadState.APPROVED: "approved",
     LeadState.PARKED: "parked",
+    LeadState.BLOCKED: "blocked",
     LeadState.DONE: "done",
 }
 
@@ -88,6 +90,7 @@ def evaluate(
     enrich_attempts: int = 0,
     enrich_max_attempts: int = 3,
     retry_failed: bool = False,
+    country_refusal: str | None = None,
 ) -> Eligibility:
     """Classify one lead.
 
@@ -98,12 +101,20 @@ def evaluate(
     is only retried with ``--retry-failed``, and a ``new`` lead at the enrich cap
     only with ``--force``. Saying so is the whole point of the module — those
     two states are otherwise invisible "nothing happened" runs.
+
+    ``country_refusal`` is supplied by the caller (``outreach.refusal_reason``)
+    so this function stays policy-free and importable without settings or a DB.
+    A blocked lead is reported before drafting and before sending, never after:
+    the operator must see the legal gate, not a mysterious empty send run.
     """
     status = str(getattr(lead, "status", "") or "")
     domain = str(getattr(lead, "domain", "") or "").strip().lower()
 
     if status in _TERMINAL_REASONS:
         return Eligibility(LeadState.DONE, "", "Done", _TERMINAL_REASONS[status])
+
+    if country_refusal and status in (LeadStatusDB.ENRICHED, LeadStatusDB.QUEUED):
+        return Eligibility(LeadState.BLOCKED, "", "Blocked", country_refusal)
 
     if status == LeadStatusDB.QUEUED:
         return Eligibility(
@@ -220,6 +231,8 @@ def reason_for_skip(
         return f"lead {lead_id} is already approved; its draft is queued"
     if eligibility.state == LeadState.PARKED:
         return f"lead {lead_id} is parked: {eligibility.reason}"
+    if eligibility.state == LeadState.BLOCKED:
+        return f"lead {lead_id} is blocked from outreach: {eligibility.reason}"
     if eligibility.state == LeadState.DONE:
         return f"lead {lead_id} is finished: {eligibility.reason}"
     return f"lead {lead_id} is not eligible to compose"

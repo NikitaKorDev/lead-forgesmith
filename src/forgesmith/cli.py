@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, TypeVar
+from typing import Annotated, Any, TypeVar
 from urllib.parse import urlparse
 
 import httpx
@@ -60,13 +60,23 @@ from forgesmith.mailer.models import (
     SendStats,
     TransportError,
 )
-from forgesmith.mailer.policy import MailPolicy, ensure_utc, mask_email
+from forgesmith.mailer.policy import MailPolicy, ensure_utc, mask_email, parse_countries
 from forgesmith.mailer.runner import send_queued
 from forgesmith.mailer.transport import SmtpTransport
-from forgesmith.sources import BaseSource, OlxSource, ShopifySource, seeds_from_paths
+from forgesmith.outreach import ColdEmailBasis, policy_for
+from forgesmith.sources import (
+    BaseSource,
+    OlxSource,
+    OvertureSource,
+    ShopifySource,
+    seeds_from_paths,
+)
 
-app = typer.Typer(add_completion=False, help="Asynchronous B2B client acquisition pipeline.")
-source_app = typer.Typer(help="Discover leads from a marketplace.")
+app = typer.Typer(
+    add_completion=False,
+    help="Self-hosted B2B lead research and outreach-operations pipeline.",
+)
+source_app = typer.Typer(help="Discover leads from a marketplace or a bulk extract.")
 db_app = typer.Typer(help="Database lifecycle.")
 app.add_typer(source_app, name="source")
 app.add_typer(db_app, name="db")
@@ -189,11 +199,39 @@ async def _consume_logged(factory: SourceFactory, label: str, engine: str = "htt
         return await _consume(factory, label, engine)
 
 
+class NullFetcher:
+    """The fetcher a local-extract stage gets: there is nothing to fetch.
+
+    It still works as an async context manager because ``_consume`` keeps one
+    code path for every source; asking it for a page means a local source
+    started crawling, which must fail loudly instead of quietly reaching the
+    network.
+    """
+
+    async def __aenter__(self) -> NullFetcher:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+    async def get(self, url: str, **kwargs: object) -> Any:
+        raise RuntimeError(f"local source tried to fetch {url}")
+
+    async def get_json(self, url: str, **kwargs: object) -> object | None:
+        raise RuntimeError(f"local source tried to fetch {url}")
+
+
 async def _consume(factory: SourceFactory, label: str, engine: str = "http") -> UpsertStats:
     await init_db()
     totals = UpsertStats()
 
-    fetcher = BrowserFetcher() if engine == "browser" else PoliteClient()
+    fetcher: Any
+    if engine == "browser":
+        fetcher = BrowserFetcher()
+    elif engine == "local":
+        fetcher = NullFetcher()
+    else:
+        fetcher = PoliteClient()
     async with fetcher as client:
         source = factory(client)
         batch: list[LeadCandidate] = []
@@ -234,6 +272,31 @@ def db_init() -> None:
 
     asyncio.run(main())
     console.print(f"[green]Database ready[/]: {settings.database_url}")
+
+
+@db_app.command("backfill-country")
+def db_backfill_country(
+    default: Annotated[
+        str, typer.Option("--default", help="Two-letter ISO code for rows with no country.")
+    ] = "PL",
+    json_output: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
+) -> None:
+    """Set ``country`` on leads that predate the column (NULL rows only)."""
+    code = default.strip().upper()
+    if len(code) != 2 or not code.isascii() or not code.isalpha():
+        console.print(f"[red]Invalid country code: {default!r}[/] (expected two letters, e.g. PL)")
+        raise typer.Exit(code=1)
+
+    async def main() -> int:
+        await init_db()
+        async with session_scope() as session:
+            return await LeadRepo(session).backfill_country(code)
+
+    updated = asyncio.run(main())
+    if json_output:
+        print(jsonlib.dumps({"country": code, "updated": updated}, indent=2))
+        return
+    console.print(f"[green]Backfilled[/] {updated} lead(s) with country {code}")
 
 
 # ----------------------------------------------------------------- sources
@@ -303,6 +366,53 @@ def source_olx(
     )
 
 
+@source_app.command("overture")
+def source_overture(
+    extract: Annotated[
+        Path | None,
+        typer.Option(help="Overture places parquet (default under data/extracts)."),
+    ] = None,
+    country: Annotated[
+        str | None,
+        typer.Option(help="ISO-3166-1 alpha-2 country to collect, e.g. PL."),
+    ] = None,
+    category: Annotated[
+        list[str] | None,
+        typer.Option("--category", help="Overture taxonomy category, e.g. furniture_store."),
+    ] = None,
+    exclude_brand: Annotated[
+        list[str] | None,
+        typer.Option("--exclude-brand", help="Drop places whose brand contains this text."),
+    ] = None,
+    min_confidence: Annotated[
+        float,
+        typer.Option(help="Minimum Overture existence confidence (0-1)."),
+    ] = 0.5,
+    allow_no_website: Annotated[
+        bool,
+        typer.Option("--allow-no-website", help="Keep places without a usable website."),
+    ] = False,
+    limit: Annotated[int | None, typer.Option(help="Max leads to store.")] = None,
+) -> None:
+    """Read a downloaded Overture places extract into leads."""
+    try:
+        source = OvertureSource(
+            NullFetcher(),
+            extract=extract or settings.overture_extract_file,
+            country=country or settings.overture_country,
+            categories=category or [],
+            exclude_brands=exclude_brand or [],
+            min_confidence=min_confidence,
+            require_website=not allow_no_website,
+            limit=limit,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1) from exc
+
+    asyncio.run(_consume_logged(lambda _client: source, "overture", "local"))
+
+
 # ------------------------------------------------------------------- reports
 @app.command("leads")
 def leads(
@@ -334,6 +444,7 @@ def leads(
                         "name": lead.name,
                         "domain": lead.domain,
                         "city": lead.city,
+                        "country": lead.country,
                         "category": lead.category,
                         "status": lead.status,
                         "platform": lead.platform,
@@ -758,6 +869,7 @@ async def _compose_no_op_note(
         ("already drafted", (LeadState.DRAFTED,)),
         ("already approved", (LeadState.APPROVED,)),
         ("parked", (LeadState.PARKED,)),
+        ("blocked by the country gate", (LeadState.BLOCKED,)),
         ("finished", (LeadState.DONE,)),
         ("ready to draft", (LeadState.READY_TO_DRAFT,)),
     )
@@ -1609,6 +1721,7 @@ def status(
         ("drafted", "drafted"),
         ("approved", "approved"),
         ("parked", "parked"),
+        ("blocked", "blocked"),
         ("domainless", "domainless"),
     ):
         table.add_row(f"  funnel: {label}", str(funnel.get(key, 0)))
@@ -1689,6 +1802,22 @@ def doctor(
             except OSError as exc:
                 add(name, "fail", f"{folder}: {exc}")
 
+        overture = settings.overture_extract
+        if overture is not None or settings.overture_extract_file.exists():
+            # Only a configured (or already downloaded) extract is checked: the
+            # default path is absent on every install that never used Overture.
+            path = settings.overture_extract_file
+            try:
+                with path.open("rb") as handle:
+                    magic = handle.read(4)
+            except OSError as exc:
+                add("overture_extract", "fail", f"{path}: {exc}")
+            else:
+                if magic == b"PAR1":
+                    add("overture_extract", "ok", f"{path} ({path.stat().st_size / 1e6:.1f} MB)")
+                else:
+                    add("overture_extract", "warn", f"{path} is not a Parquet file")
+
         try:
             SenderProfile.from_settings(settings)
             add(
@@ -1709,6 +1838,25 @@ def doctor(
             )
         except SendConfigError as exc:
             add("timezone", "fail", str(exc))
+
+        countries = parse_countries(settings.mail_countries)
+        consent = sorted(
+            code
+            for code in countries
+            if (policy := policy_for(code)) is not None
+            and policy.basis is ColdEmailBasis.CONSENT_REQUIRED
+        )
+        if not countries:
+            add("mail_countries", "fail", "empty — every lead is refused")
+        elif consent:
+            add(
+                "mail_countries",
+                "warn",
+                f"{', '.join(consent)} require(s) prior consent; remove from "
+                "FORGESMITH_MAIL_COUNTRIES (the mailer refuses them anyway)",
+            )
+        else:
+            add("mail_countries", "ok", ", ".join(sorted(countries)))
 
         add(
             "kill_switch",

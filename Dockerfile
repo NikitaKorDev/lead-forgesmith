@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
 # Two targets:
-#   slim    - compose, approve, send, source shopify (no Chromium)
+#   slim    - compose, approve, send, source shopify/overture (no Chromium)
 #   browser - source olx + enrich (adds Chromium and its system libraries)
 #
 # Build the base once, then reuse it for both:
@@ -19,12 +19,14 @@ WORKDIR /app
 
 # README.md is required by pyproject.toml (hatchling readme).
 COPY pyproject.toml uv.lock README.md ./
+# ``sources`` ships duckdb, the only extra a stage needs at run time (the GUI
+# and Playwright live outside the one-shot images).
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project
+    uv sync --frozen --no-dev --no-install-project --extra sources
 
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+    uv sync --frozen --no-dev --extra sources
 
 # ---------------------------------------------------------------------- slim
 FROM python:3.12-slim-bookworm AS slim

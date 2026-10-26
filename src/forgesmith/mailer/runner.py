@@ -33,6 +33,7 @@ from forgesmith.mailer.mime import (
 )
 from forgesmith.mailer.models import (
     QueuedMessage,
+    RecheckReason,
     RecheckResult,
     Reservation,
     SendConfigError,
@@ -43,6 +44,7 @@ from forgesmith.mailer.models import (
 )
 from forgesmith.mailer.policy import MailPolicy, ensure_utc, mask_email, warsaw_day_bounds
 from forgesmith.mailer.transport import MailTransport, SendOutcome, SmtpTransport
+from forgesmith.outreach import refusal_reason
 
 log = structlog.get_logger(__name__)
 
@@ -301,6 +303,33 @@ class SendRunner:
                 log.info("mailer.daily_cap_reached", cap=policy.daily_cap)
                 break
 
+            refusal = refusal_reason(snapshot.country, countries=policy.countries)
+            if refusal is not None:
+                # Skipped, not failed: changing ``mail_countries`` (or a
+                # backfill) must make the lead sendable on the next run.
+                stats.skipped += 1
+                log.info(
+                    "mailer.country_refused",
+                    lead_id=snapshot.lead_id,
+                    country=snapshot.country,
+                    reason=refusal,
+                )
+                continue
+
+            country_window = policy.window.for_country(snapshot.country)
+            if not force_window and not country_window.is_open(now):
+                # Deferred, not skipped: the configured window is open but the
+                # recipient's own local window is not, so this lead waits.
+                stats.deferred += 1
+                log.info(
+                    "mailer.country_window_closed",
+                    lead_id=snapshot.lead_id,
+                    country=snapshot.country,
+                    zone=country_window.zone.key,
+                    next_opening=country_window.next_opening(now).isoformat(),
+                )
+                continue
+
             message_id = make_message_id(sender_address, now)
             try:
                 raw = self._render(snapshot, sender, now=now, message_id=message_id)
@@ -319,10 +348,19 @@ class SendRunner:
                     backoff_base=policy.backoff_base,
                     backoff_cap=policy.backoff_cap,
                     allowlist=policy.allowlist,
+                    countries=policy.countries,
                     window_open=window_open,
                     under_cap=under_cap,
                 )
             if isinstance(reservation, RecheckResult):
+                if reservation.reason == RecheckReason.COUNTRY_REFUSED:
+                    stats.skipped += 1
+                    log.info(
+                        "mailer.country_refused",
+                        lead_id=snapshot.lead_id,
+                        reason=reservation.detail.get("reason"),
+                    )
+                    continue
                 if reservation.defer or reservation.reason == "retry_not_before":
                     stats.deferred += 1
                 else:

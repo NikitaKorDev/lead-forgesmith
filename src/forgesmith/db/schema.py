@@ -2,9 +2,9 @@
 
 ``Base.metadata.create_all`` creates missing tables and indexes on a fresh
 database, but it never alters an existing table. The additive pieces are
-``sends.created_at``, the reporting indexes, and the partial unique index that
-enforces one live attempt per message, so this module is a narrow completion
-step rather than a migration framework.
+``sends.created_at``, ``leads.country``, the reporting indexes, and the partial
+unique index that enforces one live attempt per message, so this module is a
+narrow completion step rather than a migration framework.
 
 The SQLite branch is exercised by the default offline suite. The Postgres
 branch is only exercised by the optional compose smoke test; both statements are
@@ -27,11 +27,20 @@ _CREATED_AT_ALTER = {
     "postgresql": "ALTER TABLE sends ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ",
 }
 
+#: ``leads`` predates the multi-country sources, so every database created
+#: before then has no country column. Nullable on purpose: "unknown" is a
+#: distinct state from "PL", and ``db backfill-country`` resolves it.
+_COUNTRY_ALTER = {
+    "sqlite": "ALTER TABLE leads ADD COLUMN country VARCHAR(2)",
+    "postgresql": "ALTER TABLE leads ADD COLUMN IF NOT EXISTS country VARCHAR(2)",
+}
+
 _INDEXES = (
     "CREATE INDEX IF NOT EXISTS ix_sends_message_id ON sends (message_id)",
     "CREATE INDEX IF NOT EXISTS ix_sends_smtp_message_id ON sends (smtp_message_id)",
     "CREATE INDEX IF NOT EXISTS ix_messages_lead_id ON messages (lead_id)",
     "CREATE INDEX IF NOT EXISTS ix_events_entity_action ON events (entity, entity_id, action)",
+    "CREATE INDEX IF NOT EXISTS ix_leads_country ON leads (country)",
 )
 
 _INDEX_NAME = re.compile(r"INDEX IF NOT EXISTS (\w+)")
@@ -83,6 +92,14 @@ def ensure_schema_sync(conn: Connection) -> None:
             statement = _CREATED_AT_ALTER.get(dialect)
             if statement is None:
                 raise RuntimeError(f"unsupported dialect for send ledger: {dialect}")
+            conn.execute(text(statement))
+
+    if inspector.has_table("leads"):
+        columns = {column["name"] for column in inspector.get_columns("leads")}
+        if "country" not in columns:
+            statement = _COUNTRY_ALTER.get(dialect)
+            if statement is None:
+                raise RuntimeError(f"unsupported dialect for lead country: {dialect}")
             conn.execute(text(statement))
 
     tables = set(inspector.get_table_names())

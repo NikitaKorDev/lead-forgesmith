@@ -1,6 +1,7 @@
 # Forgesmith — Phase 2: Enrichment
 
-**Status:** proposed, revised after an architecture debate
+**Status:** implemented. This file is the historical design record from before
+implementation; the README is the current source of truth.
 **Goals source:** `AGENTS.md` (there is no `goals.md` on disk) + `README.md`
 **Baseline:** 51 leads — 37 Shopify (all have a domain), 14 OLX (all have `domain = NULL`;
 0/14 expose `external_url`; 5/14 expose a shop subdomain). 0 contacts, 0 events.

@@ -1,8 +1,10 @@
 [project]
 name = "forgesmith"
 version = "0.1.0"
-description = "Asynchronous B2B client acquisition pipeline (extract -> enrich -> personalize -> send)"
+description = "Self-hosted B2B lead research and outreach-operations pipeline"
 readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Nikita Korshunov" }]
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27",
@@ -34,6 +36,12 @@ gui = [
     # Riverbank ships no Windows Qt binaries after 5.15.2, and the resolver
     # otherwise picks a manylinux-only PyQt5-Qt5 and fails on win_amd64.
     "PyQt5-Qt5==5.15.2; sys_platform == 'win32'",
+]
+# Bulk POI/register extracts (Overture places). Optional because it is a
+# 15 MB analytical engine that only the local-extract sources need:
+#   uv sync --extra sources
+sources = [
+    "duckdb>=1.1",
 ]
 
 [project.scripts]

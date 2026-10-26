@@ -1,15 +1,40 @@
 # Forgesmith
 
-Asynchronous B2B lead pipeline: discover e-commerce merchants, enrich them with
-contact data and business context, generate a personalized Polish pitch, and
-send it at a human pace.
+Self-hosted B2B lead research and outreach-operations pipeline: discover
+e-commerce businesses, enrich them with public contact data and business
+context, generate grounded Polish drafts with a local model, and send only
+messages a human approved and a per-country policy gate permits.
 
-Status: **Phases 0–5 implemented** — scaffold, Shopify/OLX extraction,
+Status: **Phases 0–6 implemented** — scaffold, Shopify/OLX/Overture extraction,
 storefront enrichment (domain resolution, contact emails, business context),
 grounded Polish pitch generation, an approval-gated SMTP mailer with dry-run
 `.eml` output, read-only IMAP ingest for bounces and replies (Phase 4.5),
 one-shot Docker packaging driven by Windows Task Scheduler, and a PyQt5 desktop
 console over the same CLI. See [Roadmap](#roadmap).
+
+This is an engineering portfolio project, not a bulk-mail product. Dry-run is
+the default, `approve` is a human action, and live sending is refused for
+countries whose law requires prior consent — including Poland. See
+[Legal and ethical use](#legal-and-ethical-use).
+
+## Development snapshot
+
+The local development run behind this README (October 2026) collected 400
+leads, enriched 68 of them, found 83 contacts, produced 6 drafts and approved 5.
+No live message was sent; the kill switch stayed on. That is an end-to-end
+smoke test, not a customer result. Most OLX sellers expose no website, which is
+why the pipeline also supports Overture open-data extracts.
+
+## Engineering highlights
+
+- 605 offline tests; `ruff` clean.
+- Async HTTP first, Playwright only when a host blocks plain HTTP.
+- Local Ollama drafts with hard grounding, length and plain-text validation.
+- An SMTP state machine with a reservation transaction, a partial unique index,
+  a dry-run `.eml` archive and an immutable attempt ledger.
+- Read-only IMAP ingest for DSN bounces and thread-matched replies.
+- One-shot Docker stages, Task Scheduler definitions, and a PyQt5 console that
+  shells out to the same CLI instead of re-implementing pipeline logic.
 
 ## Quick start
 
@@ -18,14 +43,14 @@ uv sync
 uv run playwright install chromium      # OLX + enrichment browser fallback
 uv run forgesmith db init
 uv run forgesmith source shopify        # probe data/shopify_seeds.txt (37 verified stores)
-uv run forgesmith source olx -q meble --city warszawa --pages 1
+uv run forgesmith source olx -q meble --city warszawa --pages 1   # check OLX terms first
 uv run forgesmith enrich --limit 10
 uv run forgesmith contacts
 uv run forgesmith compose --limit 5         # requires sender fields in .env
 uv run forgesmith drafts
 uv run forgesmith approve --all-composed    # composed -> queued (review first)
 uv run forgesmith send                      # dry run: data/outbox/*.eml
-uv run forgesmith send --live --yes --limit 1   # real SMTP, allowlist first
+uv run forgesmith send --live --yes --limit 1   # needs a permitted country in MAIL_COUNTRIES
 uv run forgesmith sends
 uv run forgesmith leads
 uv run forgesmith stats
@@ -36,6 +61,11 @@ uv run forgesmith doctor                     # pre-flight checks (exit 1 fail, 3
 For the unattended/container deployment, see
 [Containers and scheduling](#containers-and-scheduling) and
 [`ops/README.md`](ops/README.md).
+
+`MAIL_COUNTRIES` is empty by default, so `doctor` reports that every lead is
+refused until you set a country whose rules you have checked. Poland is refused
+even when listed. Read [Legal and ethical use](#legal-and-ethical-use) before
+opening SMTP.
 
 ## Desktop console (PyQt5)
 
@@ -96,7 +126,8 @@ Notes that matter in practice:
 |---|---|
 | `forgesmith db init` | Create tables (idempotent) |
 | `forgesmith source shopify [--seeds FILE ...] [--limit N]` | Probe Shopify storefronts, store catalogue metadata |
-| `forgesmith source olx -q meble --city warszawa --pages 2 [--limit N] [--engine http]` | Crawl OLX listing pages into business leads |
+| `forgesmith source olx -q meble --city warszawa --pages 2 [--limit N] [--engine http]` | Crawl OLX listing pages into business leads (check OLX terms first) |
+| `forgesmith source overture --extract FILE --country PL [--category X] [--limit N]` | Read a downloaded Overture places extract (needs `uv sync --extra sources`) |
 | `forgesmith enrich [--limit N] [--source shopify\|olx] [--lead-id N] [--force]` | Resolve storefronts, extract role-first emails and page context |
 | `forgesmith enrich --resolve-only [--source olx] [--deep-resolve]` | Write candidate domains only; no storefront crawl |
 | `forgesmith contacts [--lead-id N] [--limit 50]` | Inspect contacts Phase 3 will use |
@@ -167,9 +198,26 @@ shop posting twenty near-identical listings yields one lead. Most business ads
 expose no website (`externalUrl` is null), so OLX leads land with no domain and
 are resolved during enrichment.
 
+**Overture** — a free, bulk-downloadable places dataset with names, categories,
+addresses and websites. The operator downloads one release and the source reads
+it locally with duckdb, so there is no runtime crawl, no rate limit and no
+request budget. It is the input for the businesses that never appear in a
+marketplace. The projection is built from the parquet schema at runtime, so a
+renamed release column costs one field rather than the whole stage.
+
 **Allegro** — deliberately disabled: listings are behind DataDome and the ToS
 forbids scraping. The source interface exists so it can be enabled later through
 the official API.
+
+### Source compliance
+
+Scraping is a terms-of-service question, not a free-for-all. Shopify's public
+catalogue endpoint is read politely; OLX restricts automated access, so that
+adapter is opt-in and should be checked against OLX's current terms or replaced
+with the official API; Overture is open data. The enrichment crawler honours
+`robots.txt`, paces requests per host, validates redirects against SSRF and caps
+response size — but none of that grants permission. Do not use any source to
+build a list for outreach you are not allowed to send.
 
 ### Enrichment
 
@@ -392,7 +440,10 @@ adds the `SMTP_*` transport keys, `MAIL_DAILY_CAP`, `MAIL_DELAY_*`,
 `IMAP_PORT`, `IMAP_USER`, `IMAP_PASSWORD`, `IMAP_SSL` (465 implicit TLS) /
 `IMAP_STARTTLS` (143 STARTTLS), `IMAP_TIMEOUT`, `IMAP_MAILBOX`,
 `IMAP_LOOKBACK_DAYS`, `IMAP_FETCH_LIMIT`, and `IMAP_MAX_BODY_BYTES`. Plaintext
-IMAP is refused when both TLS options are off. `tzdata` is a data-only
+IMAP is refused when both TLS options are off. `MAIL_COUNTRIES` is empty by
+default: set it only to ISO codes whose rules you have checked. Poland is
+`consent_required` in the policy table and is refused even when listed, because
+Article 398 PKE requires prior consent. `tzdata` is a data-only
 dependency required for `Europe/Warsaw` on Windows. Run `forgesmith db init`
 after upgrading: it adds `sends.created_at`, four reporting indexes, and the
 partial unique index in place, aborting with message ids if historical duplicate
@@ -422,9 +473,10 @@ Services:
 | `ollama` | upstream | optional co-located model server (`--profile llm`) |
 | `db`, `adminer` | upstream | optional Postgres tooling only (`--profile tools`) |
 
-Live sending needs four independent gates: human approval to `queued`, the task
+Live sending needs five independent gates: human approval to `queued`, the task
 definition passing `--live --yes`, `FORGESMITH_MAIL_DRY_RUN=false` in
-`.env.live`, and the `live` profile. `approve` is never scheduled and refuses
+`.env.live`, the `live` profile, and a recipient country permitted by
+`MAIL_COUNTRIES`. `approve` is never scheduled and refuses
 to run when `FORGESMITH_APPROVAL_CHANNEL=unattended`.
 
 `ops/run.ps1` is the Task Scheduler wrapper (per-stage mutex, logs under
@@ -459,20 +511,52 @@ runs stay out of the console. Both skip cleanly when the `gui` extra is absent.
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Scaffold, config, schema, CLI | done |
-| 1 | Extraction: Shopify + OLX | done |
+| 1 | Extraction: Shopify, OLX (terms permitting) and Overture extracts | done |
 | 2 | Enrichment: domain resolution, contacts, context, platform detection | done |
 | 3 | LLM: local Ollama, JSON-schema drafts, Polish prompt, grounding/validation, review CLI | done |
 | 4 | Mailer: approval (`queued`), dry-run `.eml`, SMTP with caps/jitter/backoff, manual bounce/reply marking | done |
-| 4.5 | IMAP ingest: DSN bounces, reply/opt-out detection, automatic suppression | done |
+| 4.5 | IMAP ingest: DSN bounces, reply detection, review-only opt-outs, automatic hard-bounce suppression | done |
 | 5 | Docker packaging, one-shot containers, SQLite on a named volume, Task Scheduler + ops runbook | done |
 | 6 | Desktop console (PyQt5) over the same CLI: every stage, ledger and status in one window | done |
 
-### Legal / deliverability notes
+### Legal and ethical use
 
-Outbound B2B email in Poland sits under RODO and the e-services act. The design
-keeps to company addresses (not named individuals), always includes sender
-identity plus a one-line opt-out, honours `suppressions` before every send, and
-rate-limits per domain. Gmail app-password SMTP is a development crutch with low
-caps and real suspension risk; the mailer defaults to a dry run that writes
-`.eml` files to `data/outbox/`, and volume caps are enforced in code. Before a
-real campaign, move to a dedicated domain with SPF/DKIM/DMARC.
+This project is not legal advice. It is built for lawful, consent-based B2B
+outreach; the operator is responsible for the basis on which each message is
+sent.
+
+**Poland.** Since 10 November 2024, Article 398 of the *Prawo komunikacji
+elektronicznej* (PKE) requires prior consent before commercial information is
+sent by electronic means. The protection covers companies, named employees and
+sole traders; a published `info@` address is not consent, and there is no soft
+opt-in. The penalty can reach 3% of the previous year's revenue or PLN 1,000,000,
+whichever is higher, with additional petty-offence and unfair-competition
+exposure. The code therefore marks `PL` as `consent_required` and refuses it
+even when it appears in `MAIL_COUNTRIES`.
+
+**Other countries.** `src/forgesmith/outreach.py` carries a small policy table
+(consent-required, role-relevant, allowed) and refuses unknown countries rather
+than defaulting them to allowed. It is a starting point, not a legal opinion:
+verify the current rules for every country you enable. The lead model does not
+store a legal form, so the gate cannot distinguish, for example, a UK limited
+company from a sole trader; check that before enabling `GB`.
+
+**GDPR.** Company contact data can still be personal data. A legitimate-interest
+basis may be available for relevant B2B outreach, but you must inform people
+where the data came from, minimize what you store, honour objections and keep a
+suppression list. This project stores suppressions and an audit trail; it does
+not yet store consent records.
+
+**Scraping.** Respect `robots.txt`, terms of service, rate limits and access
+controls. OLX is the highest-risk source here: its terms restrict automated
+access. Prefer official APIs and open data such as Overture. Do not bypass a
+block or a login.
+
+**Deliverability.** Gmail app-password SMTP is a development crutch with low
+caps and real suspension risk. Before a real campaign, use a dedicated domain
+with SPF, DKIM and DMARC. `sent` means the relay accepted the message, not that
+it reached an inbox.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

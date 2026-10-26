@@ -60,6 +60,7 @@ class RecheckReason(StrEnum):
     OUTSIDE_WINDOW = "outside_window"
     DAILY_CAP = "daily_cap"
     NOT_ALLOWLISTED = "not_allowlisted"
+    COUNTRY_REFUSED = "country_refused"
     CONFIG_INVALID = "config_invalid"
 
 
@@ -84,6 +85,7 @@ class QueuedMessage:
     footer_version: str | None
     attempts: int = 0
     last_failed_at: datetime | None = None
+    country: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

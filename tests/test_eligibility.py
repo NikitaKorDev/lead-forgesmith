@@ -17,6 +17,7 @@ from typer.testing import CliRunner
 from forgesmith import cli
 from forgesmith.compose.models import ComposeOutcome, ComposeStats
 from forgesmith.compose.prompt import FOOTER_VERSION
+from forgesmith.config import settings
 from forgesmith.db.models import Contact, Enrichment, Event, Lead, Message, Suppression
 from forgesmith.db.repo import LeadRepo
 from forgesmith.db.session import session_scope
@@ -157,6 +158,46 @@ def test_enrich_attempt_cap_parks_a_new_lead() -> None:
     assert "--force" in result.reason
 
 
+# ---------------------------------------------------------------- country gate
+@pytest.mark.parametrize("status", ["enriched", "queued"])
+def test_a_country_refusal_blocks_a_sendable_lead(status: str) -> None:
+    result = _classify(
+        _lead(status, "sklep.pl"),
+        has_message=True,
+        enrichment_status="ok",
+        role_contacts=["biuro@sklep.pl"],
+        country_refusal="DE requires prior consent — cold email is not enabled for it",
+    )
+
+    assert result.state == LeadState.BLOCKED
+    assert result.action == ""
+    assert result.label == "Blocked"
+    assert "prior consent" in result.reason
+    assert not result.actionable
+
+
+def test_a_country_refusal_does_not_block_collection() -> None:
+    result = _classify(
+        _lead("new", "sklep.pl"),
+        country_refusal="lead has no country; run `forgesmith db backfill-country`",
+    )
+
+    assert result.state == LeadState.READY_TO_ENRICH
+
+
+def test_reason_for_skip_explains_a_blocked_lead() -> None:
+    blocked = _classify(
+        _lead("queued", "sklep.pl"),
+        has_message=True,
+        country_refusal="country US is not in mail_countries",
+    )
+
+    assert (
+        reason_for_skip(lead_id=7, found=True, eligibility=blocked, regenerate=False)
+        == "lead 7 is blocked from outreach: country US is not in mail_countries"
+    )
+
+
 # --------------------------------------------------------------------- reasons
 def test_reason_for_skip_names_the_exact_rule() -> None:
     assert (
@@ -203,6 +244,7 @@ async def _seed() -> dict[str, int]:
             *,
             status: str,
             domain: str | None,
+            country: str | None = "GB",
             enrichment: str | None = None,
             contact: str | None = None,
             message: bool = False,
@@ -214,6 +256,7 @@ async def _seed() -> dict[str, int]:
                 source_id=key,
                 name=key,
                 domain=domain,
+                country=country,
                 status=status,
             )
             session.add(lead)
@@ -306,7 +349,9 @@ async def _seed() -> dict[str, int]:
 
 
 @pytest.fixture
-def seeded(db) -> dict[str, int]:
+def seeded(db, monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    # The seeded leads are GB; the mailer must be cleared to mail that country.
+    monkeypatch.setattr(settings, "mail_countries", "GB")
     return asyncio.run(_seed())
 
 
@@ -331,6 +376,26 @@ def test_eligibility_map_matches_select_composable(seeded) -> None:
     assert classification[seeded["parked"]].state == LeadState.PARKED
     assert classification[seeded["capped"]].state == LeadState.PARKED
     assert classification[seeded["approved"]].state == LeadState.APPROVED
+
+
+def test_eligibility_map_refuses_a_country_the_mailer_would_refuse(seeded) -> None:
+    """The state strip must show the same gate the mailer enforces."""
+
+    async def check() -> Eligibility:
+        async with session_scope() as session:
+            lead = await session.get(Lead, seeded["composable"])
+            assert lead is not None
+            lead.country = "DE"
+        async with session_scope() as session:
+            classification = await LeadRepo(session).eligibility_map(
+                lead_ids=[seeded["composable"]]
+            )
+        return classification[seeded["composable"]]
+
+    result = asyncio.run(check())
+
+    assert result.state == LeadState.BLOCKED
+    assert result.reason == "DE requires prior consent — cold email is not enabled for it"
 
 
 def test_funnel_counts_each_stage(seeded) -> None:

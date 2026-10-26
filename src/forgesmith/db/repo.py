@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from forgesmith.config import settings
 from forgesmith.db.models import (
     Contact,
     Enrichment,
@@ -42,13 +43,14 @@ from forgesmith.mailer.models import (
     Reservation,
     SendStatus,
 )
-from forgesmith.mailer.policy import ensure_utc, retry_not_before
+from forgesmith.mailer.policy import ensure_utc, parse_countries, retry_not_before
+from forgesmith.outreach import refusal_reason
 
 if TYPE_CHECKING:
     from forgesmith.enrichment.models import EnrichmentResult
 
 _CHUNK = 200
-_MUTABLE_FIELDS = ("name", "url", "city", "category", "phone", "platform")
+_MUTABLE_FIELDS = ("name", "url", "city", "country", "category", "phone", "platform")
 
 #: Lead lifecycle is monotonic: a late writer must never erase a stronger
 #: outcome. Phase 4.5's inbox is a second writer, so a reply that lands between
@@ -285,7 +287,7 @@ class LeadRepo:
         ``leads --json``, ``compose --check`` and the GUI's stage strip all read
         this, so a lead can never be "draftable" in one place and not another.
         """
-        stmt = select(Lead.id, Lead.status, Lead.domain).order_by(Lead.id)
+        stmt = select(Lead.id, Lead.status, Lead.domain, Lead.country).order_by(Lead.id)
         if source:
             stmt = stmt.where(Lead.source == source)
         if lead_ids is not None:
@@ -293,7 +295,9 @@ class LeadRepo:
             if not wanted:
                 return {}
             stmt = stmt.where(Lead.id.in_(wanted))
-        lead_rows = [(row[0], row[1], row[2]) for row in await self.session.execute(stmt)]
+        lead_rows = [
+            (row[0], row[1], row[2], row[3]) for row in await self.session.execute(stmt)
+        ]
         if not lead_rows:
             return {}
 
@@ -327,9 +331,10 @@ class LeadRepo:
             )
         }
         suppressions = await EnrichmentRepo(self.session).load_suppressions()
+        countries = parse_countries(settings.mail_countries)
 
         result: dict[int, Eligibility] = {}
-        for lead_id, status, domain in lead_rows:
+        for lead_id, status, domain, country in lead_rows:
             result[lead_id] = evaluate(
                 _LeadFacts(status=str(status or ""), domain=domain),
                 has_message=lead_id in with_message,
@@ -342,6 +347,7 @@ class LeadRepo:
                 enrich_attempts=enrichment_attempts.get(lead_id, 0),
                 enrich_max_attempts=enrich_max_attempts,
                 retry_failed=retry_failed,
+                country_refusal=refusal_reason(country, countries=countries),
             )
         return result
 
@@ -377,6 +383,7 @@ class LeadRepo:
             "drafted": states.get(LeadState.DRAFTED, 0),
             "approved": states.get(LeadState.APPROVED, 0),
             "parked": states.get(LeadState.PARKED, 0),
+            "blocked": states.get(LeadState.BLOCKED, 0),
             "done": states.get(LeadState.DONE, 0),
         }
 
@@ -396,6 +403,18 @@ class LeadRepo:
         return {row[0]: row[1] for row in await self.session.execute(stmt)}
 
     # ----------------------------------------------------------------- write
+    async def backfill_country(self, code: str) -> int:
+        """Set ``country`` on rows that have none; returns how many changed.
+
+        Only NULL rows are touched, so a second run is a no-op and a country
+        inferred by a later source is never overwritten by the default.
+        """
+        result = await self.session.execute(
+            update(Lead).where(Lead.country.is_(None)).values(country=code)
+        )
+        await self.session.flush()
+        return int(result.rowcount or 0)
+
     async def upsert_many(self, candidates: Iterable[LeadCandidate]) -> UpsertStats:
         """Insert new leads, refresh untouched ones, skip duplicate domains.
 
@@ -451,6 +470,7 @@ class LeadRepo:
                 url=cand.url,
                 domain=cand.domain,
                 city=cand.city,
+                country=cand.country,
                 category=cand.category,
                 phone=cand.phone,
                 platform=cand.platform,
@@ -1110,6 +1130,7 @@ class MailRepo:
                     footer_version=(message.hooks or {}).get("footer_version"),
                     attempts=int(attempt_count or 0),
                     last_failed_at=ensure_utc(last_failed),
+                    country=lead.country,
                 )
             )
         if limit is not None:
@@ -1153,6 +1174,7 @@ class MailRepo:
         backoff_base: float = 300.0,
         backoff_cap: float = 3600.0,
         allowlist: frozenset[str] = frozenset(),
+        countries: frozenset[str] = frozenset(),
         window_open: bool = True,
         under_cap: bool = True,
         check_policy: bool = True,
@@ -1228,6 +1250,15 @@ class MailRepo:
                 return RecheckResult(RecheckReason.OUTSIDE_WINDOW, stop=True)
             if not under_cap:
                 return RecheckResult(RecheckReason.DAILY_CAP, stop=True)
+            # Country before allowlist: an empty ``mail_countries`` refuses
+            # everyone, while an empty allowlist admits everyone. The two gates
+            # cannot share a default.
+            refusal = refusal_reason(lead.country, countries=countries)
+            if refusal is not None:
+                return RecheckResult(
+                    RecheckReason.COUNTRY_REFUSED,
+                    detail={"country": lead.country, "reason": refusal},
+                )
             if allowlist and not _is_allowlisted(email, lead.domain, allowlist):
                 return RecheckResult(RecheckReason.NOT_ALLOWLISTED)
 
@@ -1283,6 +1314,7 @@ class MailRepo:
         backoff_base: float = 300.0,
         backoff_cap: float = 3600.0,
         allowlist: frozenset[str] = frozenset(),
+        countries: frozenset[str] = frozenset(),
         window_open: bool = True,
         under_cap: bool = True,
     ) -> Reservation | RecheckResult:
@@ -1294,6 +1326,7 @@ class MailRepo:
             backoff_base=backoff_base,
             backoff_cap=backoff_cap,
             allowlist=allowlist,
+            countries=countries,
             window_open=window_open,
             under_cap=under_cap,
         )

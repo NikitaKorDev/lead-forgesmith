@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     olx_base_url: str = "https://www.olx.pl"
     olx_max_pages: int = 3
 
+    # --- sources: overture -----------------------------------------------
+    # A local extract, not a crawl: the operator downloads the parquet once
+    # (see ops/README.md). ``None`` means "use
+    # data_dir/extracts/overture-places.parquet", so a container that mounts
+    # its data elsewhere does not need to remap every path.
+    overture_extract: Path | None = None
+    overture_country: str = "PL"
+
     # --- enrichment (phase 2) --------------------------------------------
     enrich_max_pages: int = Field(default=5, ge=1)
     enrich_max_attempts: int = Field(default=3, ge=1)
@@ -92,6 +100,13 @@ class Settings(BaseSettings):
     mail_weekdays_only: bool = True
     mail_max_attempts: int = Field(default=3, ge=1)
     mail_allowlist: str = ""
+    # Comma-separated ISO-3166-1 alpha-2 codes the operator is cleared to mail.
+    # Unlike ``mail_allowlist`` (where empty means "everyone"), an empty value
+    # here refuses every country: "empty" must never be read as the whole world.
+    # It is empty by default on purpose: the operator opts in to each country
+    # after checking its rules. Poland is refused by the outreach gate even when
+    # listed, because Article 398 PKE requires prior consent for B2B email.
+    mail_countries: str = ""
     smtp_host: str = "smtp.gmail.com"
     smtp_port: int = 587
     smtp_user: str = ""
@@ -150,6 +165,10 @@ class Settings(BaseSettings):
     @property
     def overrides_file(self) -> Path:
         return self.enrich_domain_overrides or self.data_dir / "domain_overrides.csv"
+
+    @property
+    def overture_extract_file(self) -> Path:
+        return self.overture_extract or self.data_dir / "extracts" / "overture-places.parquet"
 
     @property
     def backups_dir(self) -> Path:

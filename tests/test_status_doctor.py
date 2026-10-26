@@ -112,3 +112,83 @@ def test_doctor_json_reports_every_check(db, mail_env, monkeypatch) -> None:
     checks = {row["check"] for row in payload["checks"]}
     assert {"database", "data_dir", "outbox", "backups", "sender", "timezone"} <= checks
     assert "kill_switch" in checks
+
+
+def test_doctor_warns_when_the_overture_extract_is_not_parquet(
+    db, mail_env, monkeypatch, tmp_path
+) -> None:
+    extract = tmp_path / "overture-places.parquet"
+    extract.write_text("not a parquet file", encoding="utf-8")
+    monkeypatch.setattr(mail_env, "overture_extract", extract)
+    monkeypatch.setattr(cli.httpx, "AsyncClient", _FakeClient)
+
+    result = runner.invoke(cli.app, ["doctor", "--json"])
+
+    assert result.exit_code == 3
+    row = next(row for row in _json(result)["checks"] if row["check"] == "overture_extract")
+    assert row["status"] == "warn"
+    assert "not a Parquet file" in row["detail"]
+
+
+def test_doctor_fails_when_the_overture_extract_is_missing(
+    db, mail_env, monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(mail_env, "overture_extract", tmp_path / "gone.parquet")
+    monkeypatch.setattr(cli.httpx, "AsyncClient", _FakeClient)
+
+    result = runner.invoke(cli.app, ["doctor", "--json"])
+
+    assert result.exit_code == 1
+    row = next(row for row in _json(result)["checks"] if row["check"] == "overture_extract")
+    assert row["status"] == "fail"
+
+
+def test_doctor_ignores_the_overture_extract_that_was_never_downloaded(
+    db, mail_env, monkeypatch
+) -> None:
+    monkeypatch.setattr(cli.httpx, "AsyncClient", _FakeClient)
+
+    result = runner.invoke(cli.app, ["doctor", "--json"])
+
+    assert result.exit_code == 0, result.output
+    checks = {row["check"] for row in _json(result)["checks"]}
+    assert "overture_extract" not in checks
+
+
+def test_doctor_reports_a_downloaded_overture_extract(db, mail_env, monkeypatch) -> None:
+    extract = mail_env.data_dir / "extracts" / "overture-places.parquet"
+    extract.parent.mkdir(parents=True)
+    extract.write_bytes(b"PAR1" + b"\x00" * 60)
+    monkeypatch.setattr(cli.httpx, "AsyncClient", _FakeClient)
+
+    result = runner.invoke(cli.app, ["doctor", "--json"])
+
+    assert result.exit_code == 0, result.output
+    row = next(row for row in _json(result)["checks"] if row["check"] == "overture_extract")
+    assert row["status"] == "ok"
+
+
+def test_doctor_warns_when_mail_countries_lists_a_consent_country(
+    db, mail_env, monkeypatch
+) -> None:
+    monkeypatch.setattr(mail_env, "mail_countries", "GB,DE")
+    monkeypatch.setattr(cli.httpx, "AsyncClient", _FakeClient)
+
+    result = runner.invoke(cli.app, ["doctor", "--json"])
+
+    assert result.exit_code == 3
+    row = next(row for row in _json(result)["checks"] if row["check"] == "mail_countries")
+    assert row["status"] == "warn"
+    assert "DE" in row["detail"]
+
+
+def test_doctor_fails_when_mail_countries_is_empty(db, mail_env, monkeypatch) -> None:
+    monkeypatch.setattr(mail_env, "mail_countries", "")
+    monkeypatch.setattr(cli.httpx, "AsyncClient", _FakeClient)
+
+    result = runner.invoke(cli.app, ["doctor", "--json"])
+
+    assert result.exit_code == 1
+    row = next(row for row in _json(result)["checks"] if row["check"] == "mail_countries")
+    assert row["status"] == "fail"
+    assert "every lead is refused" in row["detail"]

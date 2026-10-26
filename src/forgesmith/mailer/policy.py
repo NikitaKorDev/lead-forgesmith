@@ -1,4 +1,4 @@
-"""Sending policy: windows, caps, pacing, backoff and allowlists.
+"""Sending policy: windows, caps, pacing, backoff, allowlists and countries.
 
 Everything here is pure and clock-injectable so DST and boundary behaviour can
 be tested offline with a fixed ``now``.
@@ -7,7 +7,7 @@ be tested offline with a fixed ``now``.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -38,6 +38,25 @@ def load_zone(name: str) -> ZoneInfo:
             f"cannot load timezone {name!r}; install tzdata (uv sync) or set "
             "FORGESMITH_MAIL_WINDOW_TZ"
         ) from exc
+
+
+#: A 09:00-17:00 window is only polite in the recipient's own timezone. The map
+#: is deliberately small: a country without a policy row is refused long before
+#: a send, so the default (the configured ``mail_window_tz``) is a fallback.
+COUNTRY_ZONES: dict[str, str] = {
+    "PL": "Europe/Warsaw",
+    "DE": "Europe/Berlin",
+    "AT": "Europe/Berlin",
+    "FR": "Europe/Paris",
+    "NL": "Europe/Amsterdam",
+    "DK": "Europe/Copenhagen",
+    "NO": "Europe/Oslo",
+    "SE": "Europe/Stockholm",
+    "FI": "Europe/Helsinki",
+    "GB": "Europe/London",
+    "US": "America/New_York",
+    "CA": "America/Toronto",
+}
 
 
 def warsaw_day_bounds(now_utc: datetime, zone: ZoneInfo) -> tuple[datetime, datetime]:
@@ -71,6 +90,17 @@ class SendingWindow:
         if self.weekdays_only and local.weekday() >= 5:
             return False
         return self.start_hour <= local.hour < self.end_hour
+
+    def for_country(self, code: str | None) -> SendingWindow:
+        """The same window moved into the recipient country's local zone.
+
+        An unknown or missing country keeps the configured zone. That is not an
+        outreach approval: ``outreach.refusal_reason`` refuses such a lead first.
+        """
+        key = COUNTRY_ZONES.get((code or "").strip().upper())
+        if key is None or key == self.zone.key:
+            return self
+        return replace(self, zone=load_zone(key))
 
     def next_opening(self, now_utc: datetime) -> datetime:
         """Next instant the window opens, returned as aware UTC."""
@@ -121,6 +151,20 @@ def parse_allowlist(raw: str | None) -> frozenset[str]:
         return frozenset()
     entries = {piece.strip().lower() for piece in raw.split(",")}
     return frozenset(entry for entry in entries if entry)
+
+
+def parse_countries(raw: str | None) -> frozenset[str]:
+    """Uppercase, two-letter ISO codes only. Empty input is an empty set.
+
+    Callers must treat the empty set as "refuse everything": unlike the email
+    allowlist, an unset ``mail_countries`` cannot mean "the whole world".
+    """
+    if not raw:
+        return frozenset()
+    entries = {piece.strip().upper() for piece in raw.split(",")}
+    return frozenset(
+        entry for entry in entries if len(entry) == 2 and entry.isascii() and entry.isalpha()
+    )
 
 
 def is_allowlisted(
@@ -179,6 +223,7 @@ class MailPolicy:
     delay_min: float = 120.0
     delay_max: float = 1800.0
     allowlist: frozenset[str] = frozenset()
+    countries: frozenset[str] = frozenset()
 
     @classmethod
     def from_settings(cls, cfg: object) -> MailPolicy:
@@ -204,6 +249,7 @@ class MailPolicy:
             delay_min=minimum,
             delay_max=maximum,
             allowlist=parse_allowlist(getattr(cfg, "mail_allowlist", "")),
+            countries=parse_countries(getattr(cfg, "mail_countries", "")),
         )
 
     def delay(self, rng: random.Random) -> float:

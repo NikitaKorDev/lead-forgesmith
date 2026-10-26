@@ -6,15 +6,18 @@ stage is a one-shot container started by the scheduler.
 
 `docker compose up -d` starts **nothing** — every service is behind a profile.
 
-## Four independent live gates
+## Five independent live gates
 
-A live message is possible only when all four hold:
+A live message is possible only when all five hold:
 
 1. The lead is `queued` and its latest message has an `approved` event
    (human approval; automation stops at `composed`).
 2. The task definition passes `--live --yes` (only `ops/tasks/forgesmith-send.xml`).
 3. `.env.live` sets `FORGESMITH_MAIL_DRY_RUN=false` (the real kill switch).
 4. The run uses `--profile live` (the `app-live` service).
+5. The recipient's country is listed in `FORGESMITH_MAIL_COUNTRIES` and is not a
+   consent-required country. Empty refuses everyone; Poland is refused even when
+   listed because Article 398 PKE requires prior consent for B2B email.
 
 `approve` has no task definition and no `run.ps1` stage; it also refuses when
 `FORGESMITH_APPROVAL_CHANNEL=unattended`.
@@ -26,7 +29,8 @@ A live message is possible only when all four hold:
 Copy-Item .env.example .env
 Copy-Item .env.example .env.live
 # Edit .env: DB, sender identity, SMTP, Ollama URL.
-# Edit .env.live: FORGESMITH_MAIL_DRY_RUN=false plus SMTP/sender values.
+# Edit .env.live: FORGESMITH_MAIL_DRY_RUN=false plus SMTP/sender values,
+# and FORGESMITH_MAIL_COUNTRIES set to a country you have checked.
 icacls .env      /inheritance:r /grant:r "$env:USERNAME:(R,W)"
 icacls .env.live /inheritance:r /grant:r "$env:USERNAME:(R,W)"
 
@@ -52,6 +56,7 @@ Get-ChildItem outbox
 
 # 6. Allowlisted live smoke test (one message)
 # .env.live: FORGESMITH_MAIL_ALLOWLIST=you@example.com
+# .env.live: FORGESMITH_MAIL_COUNTRIES=GB   # use a country whose rules you checked
 docker compose --profile live run --rm -T app-live forgesmith send --live --yes --limit 1
 
 # 7. Schedule
@@ -61,6 +66,67 @@ schtasks /Query /TN "Forgesmith\send" /V /FO LIST
 
 Keep `FORGESMITH_MAIL_DRY_RUN=true` for the first full scheduled day. Flip it in
 `.env.live` only after the dry day looks clean.
+
+## Overture places extract (one-time, then monthly)
+
+`source overture` reads a **local** file and never downloads anything. Fetching
+that file is a manual ops step, not a scheduled crawl: the places theme is tens
+of GB, so re-downloading it on a timer would dwarf every other task.
+
+1. Take the latest release from the [release calendar](https://docs.overturemaps.org/release-calendar/)
+   and its places theme, place type:
+   `s3://overturemaps-us-west-2/release/<release>/theme=places/type=place/*`.
+   Those artifacts are GeoParquet (Parquet with a WKB geometry column).
+2. Cut it down to the market you mail, on the host, with the same duckdb the
+   `sources` extra installs. Replace `<release>` with e.g. `2026-10-21.0`:
+
+   ```powershell
+   @'
+   import duckdb
+   duckdb.connect().execute("""
+       LOAD httpfs;
+       SET s3_region = 'us-west-2';
+       COPY (
+           SELECT "id", "names", "taxonomy", "basic_category", "confidence",
+                  "operating_status", "websites", "phones", "emails", "socials",
+                  "brand", "addresses"
+           FROM read_parquet('s3://overturemaps-us-west-2/release/<release>/theme=places/type=place/*')
+           WHERE "addresses"[1]."country" = 'PL'
+       ) TO 'overture-places.parquet' (FORMAT parquet);
+   """)
+   '@ | uv run --extra sources python -
+   ```
+
+3. Put it where the stage expects it. Host-side the default is
+   `data/extracts/overture-places.parquet` (git-ignored). In a container the
+   path is `/app/data/extracts/overture-places.parquet`, inside the `fs-data`
+   volume:
+
+   ```powershell
+   docker compose --profile app run --rm -T -v "${PWD}:/src" --entrypoint sh app `
+     -c "mkdir -p /app/data/extracts && cp /src/overture-places.parquet /app/data/extracts/"
+   ```
+
+   Anywhere else is fine too: point `FORGESMITH_OVERTURE_EXTRACT` at the file.
+4. Check and collect (nothing is scheduled for this stage):
+
+   ```powershell
+   docker compose --profile app run --rm -T app forgesmith doctor
+   docker compose --profile app run --rm -T app forgesmith source overture --country PL --limit 200
+   ```
+
+`doctor` reports `overture_extract` only when the file is configured or already
+present and cannot be read or is not Parquet; a host that never downloaded one
+is not treated as broken. A stage run is recorded in the ledger like any other,
+and `--limit` is what keeps a country-sized extract from filling the database in
+one go.
+
+The places theme is published under the
+[CDLA Permissive 2.0](https://cdla.dev/permissive-2-0/) and
+[Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0) licences, depending on
+the provider behind each record, and is not derived from OpenStreetMap data.
+Cite `Overture Maps Foundation, overturemaps.org` with the access date wherever
+a derived contact list leaves this pipeline.
 
 ## Timetable
 

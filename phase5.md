@@ -1,10 +1,11 @@
 # Forgesmith — Phase 5: Containerization + unattended scheduler (final plan)
 
-**Status:** design frozen after a three-round advocate / red-team debate; not implemented.
+**Status:** implemented. This file is the historical design record from before
+implementation; the README is the current source of truth.
 **Goal source:** `AGENTS.md` ("Package the script in Docker to run autonomously in the
 background"), `README.md` roadmap ("Docker packaging + unattended scheduler"), `phase4.md`.
-**Baseline:** Phases 0–4 implemented, 278 offline tests pass, ruff clean. Phase 4.5 (IMAP
-ingest) is designed in `phase4.5.md` but **not implemented**; Phase 5 must not absorb it.
+**Baseline:** Phases 0-4 implemented, 278 offline tests pass, ruff clean. Phase 4.5 (IMAP
+ingest) is implemented separately in `phase4.5.md`; Phase 5 does not own it.
 **Plan location:** `C:\Users\Nikita\.opencode\plan\phase5.md` (move to the repo root with the
 other phase docs when implementation starts).
 **Debate record:** §3. Two opposing topologies, an independent repo-verification pass, and a

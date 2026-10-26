@@ -15,6 +15,18 @@ def test_policy_builds_from_settings(mail_env) -> None:
     assert policy.max_attempts == 3
 
 
+def test_policy_parses_mail_countries(mail_env, monkeypatch) -> None:
+    monkeypatch.setattr(mail_env, "mail_countries", " pl, de ")
+
+    assert MailPolicy.from_settings(mail_env).countries == frozenset({"PL", "DE"})
+
+
+def test_an_empty_mail_countries_is_an_empty_set(mail_env, monkeypatch) -> None:
+    monkeypatch.setattr(mail_env, "mail_countries", "")
+
+    assert MailPolicy.from_settings(mail_env).countries == frozenset()
+
+
 def test_missing_sender_identity_is_actionable(monkeypatch) -> None:
     monkeypatch.setattr(settings, "mail_from_name", "")
     with pytest.raises(SendConfigError, match="MAIL_FROM_NAME"):

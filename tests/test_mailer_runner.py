@@ -410,3 +410,65 @@ async def test_poison_lead_does_not_starve_the_queue(seed_queued, mail_env, mail
 
     assert stats.sent == 1
     assert transport.calls[0][1] == fresh.email
+
+
+async def test_a_consent_country_is_skipped_without_an_attempt(
+    seed_queued, mail_env, mail_sender
+) -> None:
+    seeded = await seed_queued(country="DE")
+    transport = FakeTransport([_outcome(SendStatus.SENT)])
+
+    stats = await send_queued(
+        settings=mail_env,
+        sender=mail_sender,
+        live=True,
+        transport=transport,
+        now=lambda: NOW,
+    )
+
+    assert (stats.sent, stats.skipped, stats.failed) == (0, 1, 0)
+    assert transport.calls == []
+    async with session_scope() as session:
+        sends = (await session.execute(select(func.count()).select_from(Send))).scalar_one()
+        lead = await session.get(Lead, seeded.lead_id)
+    assert sends == 0
+    assert lead is not None and lead.status == "queued"
+
+
+async def test_a_closed_country_window_defers_and_sends_later(
+    seed_queued, mail_env, mail_sender, monkeypatch
+) -> None:
+    monkeypatch.setattr(mail_env, "mail_window_start", 9)
+    monkeypatch.setattr(mail_env, "mail_window_end", 17)
+    monkeypatch.setattr(mail_env, "mail_countries", "US")
+    seeded = await seed_queued(country="US")
+    transport = FakeTransport([_outcome(SendStatus.SENT)])
+
+    # 11:00 in Warsaw, 05:00 in New York: the outer window is open, the
+    # recipient's own window is not.
+    stats = await send_queued(
+        settings=mail_env,
+        sender=mail_sender,
+        live=True,
+        transport=transport,
+        now=lambda: NOW,
+    )
+
+    assert (stats.sent, stats.deferred, stats.failed) == (0, 1, 0)
+    assert transport.calls == []
+    async with session_scope() as session:
+        sends = (await session.execute(select(func.count()).select_from(Send))).scalar_one()
+        lead = await session.get(Lead, seeded.lead_id)
+    assert sends == 0
+    assert lead is not None and lead.status == "queued"
+
+    later = NOW + timedelta(hours=4)  # 09:00 in New York
+    sent = await send_queued(
+        settings=mail_env,
+        sender=mail_sender,
+        live=True,
+        transport=FakeTransport([_outcome(SendStatus.SENT)]),
+        now=lambda: later,
+    )
+
+    assert (sent.sent, sent.deferred) == (1, 0)

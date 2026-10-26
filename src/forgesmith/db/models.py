@@ -56,6 +56,7 @@ class Lead(Base):
         UniqueConstraint("source", "source_id", name="uq_leads_source_source_id"),
         Index("ix_leads_domain", "domain"),
         Index("ix_leads_status", "status"),
+        Index("ix_leads_country", "country"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -65,6 +66,9 @@ class Lead(Base):
     url: Mapped[str | None] = mapped_column(String(2048))
     domain: Mapped[str | None] = mapped_column(String(255))
     city: Mapped[str | None] = mapped_column(String(128))
+    # Nullable: sources that cannot know the market (Shopify) leave it empty
+    # until ``db backfill-country`` or a later enrichment fills it in.
+    country: Mapped[str | None] = mapped_column(String(2))
     category: Mapped[str | None] = mapped_column(String(255))
     phone: Mapped[str | None] = mapped_column(String(64))
     platform: Mapped[str | None] = mapped_column(String(64))

@@ -26,6 +26,26 @@ def test_explicit_seed_and_override_paths_still_win(monkeypatch, tmp_path: Path)
     assert config.overrides_file == tmp_path / "custom.csv"
 
 
+def test_overture_extract_defaults_under_the_data_dir(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("FORGESMITH_DATA_DIR", str(tmp_path))
+    config = Settings(_env_file=None)
+
+    assert config.overture_extract is None
+    assert config.overture_extract_file == tmp_path / "extracts" / "overture-places.parquet"
+    assert config.overture_country == "PL"
+
+
+def test_explicit_overture_extract_wins(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("FORGESMITH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("FORGESMITH_OVERTURE_EXTRACT", str(tmp_path / "elsewhere.parquet"))
+    monkeypatch.setenv("FORGESMITH_OVERTURE_COUNTRY", "DE")
+    config = Settings(_env_file=None)
+
+    assert config.overture_extract == tmp_path / "elsewhere.parquet"
+    assert config.overture_extract_file == tmp_path / "elsewhere.parquet"
+    assert config.overture_country == "DE"
+
+
 def test_ollama_url_is_explicit_for_containers(monkeypatch) -> None:
     monkeypatch.setenv("FORGESMITH_OLLAMA_BASE_URL", "http://host.docker.internal:11434")
     config = Settings(_env_file=None)

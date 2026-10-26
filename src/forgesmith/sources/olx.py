@@ -7,6 +7,10 @@ Two strategies, in order of reliability:
 An offer page is not the outbound target: enrichment resolves the seller to
 their own storefront, because OLX contact goes through a form.
 
+Terms of service: OLX restricts automated access. This adapter is opt-in and
+kept for local research only; check the current OLX terms or use the official
+API before running it. It does not bypass authentication, a paywall or a block.
+
 URL shapes verified against production:
     /oferty/warszawa/q-meble/            query + city
     /nieruchomosci/mieszkania/wynajem/warszawa/   category path + city
@@ -79,6 +83,13 @@ class OlxSource(BaseSource):
         return urls
 
     async def discover(self) -> AsyncIterator[LeadCandidate]:
+        log.warning(
+            "olx.terms_review",
+            detail=(
+                "OLX restricts automated access; verify the current terms or use the "
+                "official API before relying on this source"
+            ),
+        )
         seen: set[str] = set()
         for listing_url in self.listing_urls():
             if not self._budget_left():
@@ -200,6 +211,7 @@ class OlxSource(BaseSource):
             url=raw_url,
             domain=str(external_url) if external_url else None,
             city=city,
+            country="PL",
             category=category,
             phone=None,
             platform="olx",

@@ -58,6 +58,21 @@ def test_marketplace_lead_keeps_explicit_domain() -> None:
     assert candidate.domain is None
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("pl", "PL"), (" de ", "DE"), (None, None), ("", None), ("   ", None)],
+)
+def test_country_is_normalized_to_uppercase(raw: str | None, expected: str | None) -> None:
+    candidate = LeadCandidate(source=LeadSource.OLX, source_id="olx:1", name="Mebis", country=raw)
+    assert candidate.country == expected
+
+
+@pytest.mark.parametrize("raw", ["POL", "P", "P1", "PŁ", "🇵🇱", "12"])
+def test_country_rejects_anything_but_two_ascii_letters(raw: str) -> None:
+    with pytest.raises(ValueError, match="two-letter"):
+        LeadCandidate(source=LeadSource.OLX, source_id="olx:1", name="Mebis", country=raw)
+
+
 def test_upsert_stats_adds() -> None:
     first = UpsertStats(inserted=1, updated=2, duplicates=3)
     second = UpsertStats(inserted=1, updated=1, duplicates=0)

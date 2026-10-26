@@ -526,7 +526,12 @@ def funnel_line(payload: dict[str, Any]) -> str:
         f"{_count(funnel.get('collected'))} leads",
         f"{_count(funnel.get('with_domain'))} with a domain",
     ]
-    for key, label in (("domainless", "domainless"), ("parked", "parked"), ("done", "finished")):
+    for key, label in (
+        ("domainless", "domainless"),
+        ("parked", "parked"),
+        ("blocked", "blocked by country"),
+        ("done", "finished"),
+    ):
         count = _count(funnel.get(key))
         if count:
             parts.append(f"{count} {label}")

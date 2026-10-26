@@ -9,62 +9,19 @@ the wrong company, which is worse than an explicit ``no_site``.
 from __future__ import annotations
 
 import csv
-import ipaddress
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 import structlog
 
-from forgesmith.domain import parse_domain, registrable_domain, same_site
+from forgesmith.blocklist import usable_host
+from forgesmith.domain import parse_domain, same_site
 from forgesmith.enrichment.fetch import SiteFetcher
 from forgesmith.enrichment.site import parse_html
 
 log = structlog.get_logger(__name__)
 
-_BLOCKED_DOMAINS = {
-    "olx.pl",
-    "olxgroup.com",
-    "olxcdn.com",
-    "olx.org",
-    "olx.bg",
-    "olx.ro",
-    "olx.ua",
-    "olx.pt",
-    "otodom.pl",
-    "otomoto.pl",
-    "obido.pl",
-    "allegro.pl",
-    "ceneo.pl",
-    "facebook.com",
-    "instagram.com",
-    "youtube.com",
-    "tiktok.com",
-    "twitter.com",
-    "x.com",
-    "linkedin.com",
-    "google.com",
-    "apple.com",
-    "goo.gl",
-    "linktr.ee",
-    "bit.ly",
-    "tinyurl.com",
-    "wikipedia.org",
-}
-_BLOCKED_SUFFIXES = (
-    ".olx.pl",
-    ".olxstatic.com",
-    ".olxcdn.com",
-    ".olx.org",
-    ".olxgroup.com",
-    ".facebook.com",
-    ".instagram.com",
-    ".google.com",
-    ".gstatic.com",
-    ".apple.com",
-    ".cloudfront.net",
-    ".googleusercontent.com",
-)
 _WEBSITE_HINTS = ("strona", "www", "sklep", "website", "odwiedź", "odwiedz", "zobacz")
 
 
@@ -89,25 +46,9 @@ def load_overrides(path: Path) -> dict[int, str]:
             if not raw_id.isdigit() or not raw_domain:
                 continue
             domain = parse_domain(raw_domain)
-            if domain and _usable_host(domain):
+            if domain and usable_host(domain):
                 overrides[int(raw_id)] = domain
     return overrides
-
-
-def _usable_host(host: str | None) -> bool:
-    if not host or "." not in host:
-        return False
-    host = host.lower().removeprefix("www.")
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        pass
-    else:
-        return False
-    base = registrable_domain(host)
-    if host in _BLOCKED_DOMAINS or (base and base in _BLOCKED_DOMAINS):
-        return False
-    return not host.endswith(_BLOCKED_SUFFIXES)
 
 
 def extract_external_domain(html: str, page_url: str, *, own_domain: str | None) -> str | None:
@@ -121,7 +62,7 @@ def extract_external_domain(html: str, page_url: str, *, own_domain: str | None)
             continue
         absolute = urljoin(page_url, href)
         host = parse_domain(absolute)
-        if not host or host in seen or not _usable_host(host):
+        if not host or host in seen or not usable_host(host):
             continue
         if own_domain and same_site(host, own_domain):
             continue
@@ -146,7 +87,7 @@ async def resolve_domain(
     """Return a domain with its provenance, or ``None`` when nothing is usable."""
     lead_id = getattr(lead, "id", 0)
     domain = getattr(lead, "domain", None)
-    if domain and _usable_host(domain):
+    if domain and usable_host(domain):
         return ResolvedDomain(
             domain=domain,
             source="source",

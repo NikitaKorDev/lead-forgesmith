@@ -28,7 +28,7 @@ LEAD_STATUSES = (
 )
 SEND_STATUSES = ("pending", "sent", "failed", "bounced", "uncertain", "aborted")
 INBOUND_STATUSES = ("new", "applied", "needs_review", "ignored", "failed")
-SOURCES = ("shopify", "olx")
+SOURCES = ("shopify", "olx", "overture")
 ENGINES = ("auto", "http", "browser")
 
 
@@ -105,6 +105,7 @@ TABLES: dict[str, tuple[Column, ...]] = {
         Column("name", "name", 250),
         Column("domain", "domain", 190),
         Column("city", "city", 95),
+        Column("country", "country", 60),
         Column("category", "category", 100),
         Column("status", "status", 85),
         Column("action_label", "next", 110),
@@ -231,6 +232,55 @@ COMMANDS: tuple[Command, ...] = (
                 choices=("browser", "http"),
                 default="browser",
             ),
+        ),
+    ),
+    Command(
+        id="source_overture",
+        label="Read Overture extract",
+        argv=("source", "overture"),
+        summary="Query a downloaded Overture places parquet for businesses with a website.",
+        long_running=True,
+        notice=(
+            "Local extract: nothing is downloaded here. ops/README.md covers the "
+            "one-time Overture places download."
+        ),
+        fields=(
+            Field(
+                "extract",
+                "Extract file",
+                kind="path",
+                placeholder="data/extracts/overture-places.parquet",
+            ),
+            Field("country", "Country", placeholder="default: PL", help="ISO-3166-1 alpha-2."),
+            Field(
+                "category",
+                "Categories",
+                kind="multi",
+                placeholder="furniture_store, store",
+                help="Comma-separated Overture taxonomy categories.",
+            ),
+            Field(
+                "exclude_brand",
+                "Exclude brands",
+                kind="multi",
+                placeholder="Salon Meble, Agata Meble",
+                help="Case-insensitive substring; chains have a branch per city.",
+            ),
+            Field(
+                "min_confidence",
+                "Min confidence",
+                kind="float",
+                minimum=0,
+                maximum=1,
+                default=0.5,
+            ),
+            Field(
+                "allow_no_website",
+                "Keep places without a website",
+                kind="bool",
+                help="Off: only places that hand enrichment a domain.",
+            ),
+            Field("limit", "Max leads to store", kind="int", minimum=1, placeholder="no limit"),
         ),
     ),
     Command(

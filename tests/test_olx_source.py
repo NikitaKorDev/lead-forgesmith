@@ -61,6 +61,7 @@ def test_parse_keeps_business_and_dedupes_by_seller() -> None:
     assert lead.source_id == "olx:900"
     assert lead.name == "Mebis"
     assert lead.city == "Warszawa"
+    assert lead.country == "PL"
     assert lead.category == "meble"
     assert lead.domain == "mebis.pl"
     assert lead.raw["ad"]["title"] == "Pufa 5w1 smart meble"

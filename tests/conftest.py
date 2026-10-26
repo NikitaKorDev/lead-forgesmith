@@ -50,6 +50,9 @@ def mail_env(tmp_path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(settings, "sender_company", "Studio Testowe")
     monkeypatch.setattr(settings, "sender_offer", "automatyzacja zbierania danych")
     monkeypatch.setattr(settings, "mail_allowlist", "")
+    # Tests exercise the live path. Use a permitted country: Poland is
+    # consent-required, and a deliberate "PL" would refuse every seeded lead.
+    monkeypatch.setattr(settings, "mail_countries", "GB")
     monkeypatch.setattr(settings, "mail_daily_cap", 20)
     monkeypatch.setattr(settings, "mail_window_start", 0)
     monkeypatch.setattr(settings, "mail_window_end", 24)
@@ -91,6 +94,7 @@ async def seed_queued(db, mail_env):
         body: str = MAIL_BODY,
         subject: str = "Pomysł na uproszczenie oferty",
         contact_id: int | None = None,
+        country: str | None = "GB",
     ) -> SimpleNamespace:
         async with session_scope() as session:
             lead = Lead(
@@ -99,6 +103,7 @@ async def seed_queued(db, mail_env):
                 name=f"Sklep {source_id}",
                 url=f"https://{source_id}/",
                 domain=domain,
+                country=country,
                 status=lead_status,
             )
             session.add(lead)

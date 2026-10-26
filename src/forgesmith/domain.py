@@ -112,6 +112,7 @@ class LeadSource(StrEnum):
     SHOPIFY = "shopify"
     OLX = "olx"
     ALLEGRO = "allegro"
+    OVERTURE = "overture"
     MANUAL = "manual"
 
 
@@ -241,6 +242,7 @@ class LeadCandidate(BaseModel):
     url: str | None = None
     domain: str | None = None
     city: str | None = None
+    country: str | None = None
     category: str | None = None
     phone: str | None = None
     platform: str | None = None
@@ -255,6 +257,19 @@ class LeadCandidate(BaseModel):
     @classmethod
     def _clean_domain(cls, value: str | None) -> str | None:
         return parse_domain(value) if value else value
+
+    @field_validator("country")
+    @classmethod
+    def _clean_country(cls, value: str | None) -> str | None:
+        """ISO-3166-1 alpha-2, uppercase. Blank means "not known yet"."""
+        if not value:
+            return None
+        code = value.strip().upper()
+        if not code:
+            return None
+        if len(code) != 2 or not code.isascii() or not code.isalpha():
+            raise ValueError(f"country must be a two-letter ISO 3166-1 code, got {value!r}")
+        return code
 
     @classmethod
     def from_site(

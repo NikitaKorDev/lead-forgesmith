@@ -12,6 +12,7 @@ data/*.db-wal
 data/*.db-shm
 data/outbox/
 data/backups/
+data/extracts/
 outbox/*
 !outbox/.gitkeep
 backups/*
