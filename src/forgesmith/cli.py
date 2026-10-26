@@ -45,7 +45,7 @@ from forgesmith.db import (
 )
 from forgesmith.db.models import Event
 from forgesmith.domain import LeadCandidate, UpsertStats
-from forgesmith.eligibility import LeadState, reason_for_skip
+from forgesmith.eligibility import STATE_LABELS, LeadState, reason_for_skip
 from forgesmith.enrichment import RunStats, enrich_pending
 from forgesmith.http import PoliteClient
 from forgesmith.inbox.models import InboundKind, InboundStatus, InboxConfigError, InboxError
@@ -668,6 +668,9 @@ async def _compose_check(
             {
                 "lead_id": candidate,
                 "state": str(item.state) if item else "missing",
+                "state_label": (
+                    STATE_LABELS.get(item.state, str(item.state)) if item else "missing"
+                ),
                 "next_action": item.action if item else None,
                 "reason": item.reason if item else "lead does not exist",
                 "eligible": candidate in classification
@@ -707,7 +710,7 @@ def _print_compose_check(report: dict[str, object]) -> None:
         assert isinstance(row, dict)
         table.add_row(
             str(row["lead_id"]),
-            str(row["state"]),
+            str(row.get("state_label") or row["state"]),
             str(row["next_action"] or "-"),
             str(row["reason"] or "-"),
         )

@@ -101,13 +101,14 @@ class Column:
 TABLES: dict[str, tuple[Column, ...]] = {
     "leads": (
         Column("id", "id", 50, "right"),
-        Column("source", "source", 70),
-        Column("name", "name", 240),
-        Column("domain", "domain", 170),
-        Column("city", "city", 100),
-        Column("category", "category", 110),
-        Column("status", "status", 90),
-        Column("platform", "platform", 80),
+        Column("source", "source", 65),
+        Column("name", "name", 250),
+        Column("domain", "domain", 190),
+        Column("city", "city", 95),
+        Column("category", "category", 100),
+        Column("status", "status", 85),
+        Column("action_label", "next", 110),
+        Column("reason", "why", 240),
     ),
     "contacts": (
         Column("lead_id", "lead", 50, "right"),
@@ -118,13 +119,11 @@ TABLES: dict[str, tuple[Column, ...]] = {
         Column("source_url", "source", 260),
     ),
     "drafts": (
-        Column("message_id", "msg", 55, "right"),
-        Column("lead_id", "lead", 50, "right"),
-        Column("company", "company/domain", 170),
-        Column("contact", "contact", 210),
-        Column("subject", "subject", 300),
-        Column("lead_status", "lead status", 90),
-        Column("created_at", "created", 140),
+        Column("message_id", "msg", 50, "right"),
+        Column("lead_id", "lead", 45, "right"),
+        Column("company", "company/domain", 150),
+        Column("contact", "contact", 190),
+        Column("subject", "subject", 250),
     ),
     "sends": (
         Column("id", "send", 50, "right"),
@@ -165,6 +164,12 @@ TABLES: dict[str, tuple[Column, ...]] = {
         Column("duration_s", "secs", 70, "right"),
         Column("stop_reason", "stop", 110),
         Column("error", "error", 300),
+    ),
+    "compose_check": (
+        Column("lead_id", "lead", 55, "right"),
+        Column("state_label", "state", 150),
+        Column("next_action", "next", 90),
+        Column("reason", "reason", 460),
     ),
 }
 
@@ -256,6 +261,7 @@ COMMANDS: tuple[Command, ...] = (
                 "deep_resolve",
                 "Deep resolve",
                 kind="bool",
+                default=True,
                 help="Try OLX offer pages when no shop subdomain exists.",
             ),
             Field("force", "Force re-enrich", kind="bool", advanced=True),
@@ -592,12 +598,14 @@ def is_dangerous(spec: Command, values: dict[str, Any]) -> bool:
 
 # ---------------------------------------------------------------- json output
 JSON_COMMANDS: dict[str, tuple[str, ...]] = {
+    "status": ("status", "--json"),
     "leads": ("leads", "--json"),
     "contacts": ("contacts", "--json"),
     "drafts": ("drafts", "--json"),
     "sends": ("sends", "--json"),
     "outbox": ("outbox", "--json"),
     "inbound": ("inbox", "list", "--json"),
+    "compose_check": ("compose", "--check", "--json"),
 }
 
 

@@ -43,11 +43,21 @@ def parse_payload(text: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def rows_of(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = payload.get("rows")
+def rows_of(payload: dict[str, Any], key: str = "rows") -> list[dict[str, Any]]:
+    rows = payload.get(key)
     if isinstance(rows, list):
         return [row for row in rows if isinstance(row, dict)]
     return []
+
+
+def rows_where_action(payload: dict[str, Any], actions: tuple[str, ...]) -> list[dict[str, Any]]:
+    """Keep the rows whose shared eligibility state points at one of ``actions``.
+
+    Display-only: the rule itself lives in ``forgesmith.eligibility`` and
+    arrives on each row as ``next_action``, so the GUI never re-derives it.
+    """
+    wanted = set(actions)
+    return [row for row in rows_of(payload) if row.get("next_action") in wanted]
 
 
 def human_bytes(count: object) -> str:
@@ -83,7 +93,9 @@ def _short_stamp(value: object) -> str:
         stamp = datetime.fromisoformat(text)
     except ValueError:
         return text
-    suffix = "UTC" if stamp.utcoffset() is not None and stamp.utcoffset().total_seconds() == 0 else ""
+    suffix = (
+        "UTC" if stamp.utcoffset() is not None and stamp.utcoffset().total_seconds() == 0 else ""
+    )
     return (stamp.strftime("%d %b %H:%M") + (" " + suffix if suffix else "")).strip()
 
 
@@ -205,9 +217,19 @@ def doctor_headline(payload: dict[str, Any]) -> Kpi:
     failures = sum(1 for check in checks if check.get("status") == "fail")
     warnings = sum(1 for check in checks if check.get("status") == "warn")
     if failures:
-        return Kpi("doctor", f"{failures} failing", "bad", f"{warnings} warning(s)")
+        return Kpi(
+            "doctor",
+            f"{failures} failing",
+            "bad",
+            f"{warnings} warning{_plural(warnings)}",
+        )
     if warnings:
-        return Kpi("doctor", f"{warnings} warning(s)", "warn", "no failures")
+        return Kpi(
+            "doctor",
+            f"{warnings} warning{_plural(warnings)}",
+            "warn",
+            "no failures",
+        )
     return Kpi("doctor", "all clear", "ok")
 
 
@@ -240,3 +262,211 @@ def timestamp(value: object) -> str:
     if "T" in text:
         return text.split("T", 1)[1][:8]
     return text or "-"
+
+
+# ------------------------------------------------------------------ the stages
+#: The six pipeline stages, in order. Page ids match ``app.NAV_PAGES``.
+STAGES: tuple[tuple[str, str, str], ...] = (
+    ("collect", "1", "Collect"),
+    ("enrich", "2", "Enrich"),
+    ("draft", "3", "Draft"),
+    ("approve", "4", "Approve"),
+    ("send", "5", "Send"),
+    ("replies", "6", "Replies"),
+)
+
+STAGE_LABELS: dict[str, str] = {page: label for page, _number, label in STAGES}
+
+#: Which ``status --json`` blockers stop a stage from doing its work.
+STAGE_BLOCKERS: dict[str, tuple[str, ...]] = {
+    "draft": ("ollama", "sender"),
+    "send": ("kill_switch", "window"),
+}
+
+
+def _count(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _plural(count: int) -> str:
+    return "" if count == 1 else "s"
+
+
+def stage_counts(payload: dict[str, Any]) -> dict[str, int]:
+    """Work waiting at each stage, straight from the ``status --json`` funnel.
+
+    Every number is the size of the set that stage's own CLI run would select:
+    ``enrichable`` is what ``enrich`` picks up, ``composable`` what ``compose``
+    picks up, ``approved`` what ``send`` may deliver, and so on. The strip
+    therefore cannot promise work a run would refuse.
+    """
+    empty = {page: 0 for page, _number, _label in STAGES}
+    if not payload:
+        return empty
+    funnel = payload.get("funnel")
+    inbox = payload.get("inbox")
+    funnel = funnel if isinstance(funnel, dict) else {}
+    inbox = inbox if isinstance(inbox, dict) else {}
+    return {
+        "collect": _count(funnel.get("collected")),
+        "enrich": _count(funnel.get("enrichable")),
+        "draft": _count(funnel.get("composable")),
+        "approve": _count(funnel.get("drafted")),
+        "send": _count(funnel.get("approved")),
+        "replies": _count(inbox.get("needs_review")),
+    }
+
+
+@dataclass(frozen=True)
+class NextStep:
+    """The single thing to do next, and the page that does it."""
+
+    title: str
+    detail: str
+    page: str
+    action: str
+    tone: str = "info"
+
+
+def next_step(payload: dict[str, Any]) -> NextStep:
+    """Pick one next step, finishing work in flight before pulling more through.
+
+    The order is deliberate: an unapplied inbound row can be a legal opt-out, a
+    draft is one click from being sendable, and only then is it worth drafting
+    or enriching more. Without a rule the operator is left staring at eight
+    pages of counts.
+    """
+    if not payload:
+        return NextStep(
+            "Read the pipeline",
+            "status has not loaded yet — press Refresh.",
+            "pipeline",
+            "Refresh",
+            "muted",
+        )
+    counts = stage_counts(payload)
+    funnel = payload.get("funnel")
+    funnel = funnel if isinstance(funnel, dict) else {}
+    parked = _count(funnel.get("parked"))
+
+    if counts["replies"]:
+        return NextStep(
+            f"Apply {counts['replies']} inbound row{_plural(counts['replies'])}",
+            "Bounces, replies and opt-outs wait in the review ledger. "
+            "Opt-outs suppress only the sender's address.",
+            "replies",
+            "Open Replies",
+            "warn",
+        )
+    if counts["approve"]:
+        return NextStep(
+            f"Review {counts['approve']} draft{_plural(counts['approve'])}",
+            "A draft already exists. Read it, then approve it to queue it for sending.",
+            "approve",
+            "Open Approve",
+            "warn",
+        )
+    if counts["send"]:
+        return NextStep(
+            f"Send {counts['send']} approved message{_plural(counts['send'])}",
+            "Approved mail waits in the queue. Dry run first; live send also needs "
+            "the kill switch off and the window open.",
+            "send",
+            "Open Send",
+            "info",
+        )
+    if counts["draft"]:
+        return NextStep(
+            f"Draft {counts['draft']} email{_plural(counts['draft'])}",
+            "These leads are enriched and have a role address, with no draft yet.",
+            "draft",
+            "Open Draft",
+            "info",
+        )
+    if counts["enrich"]:
+        detail = "Resolve storefronts and extract role-first addresses."
+        if parked:
+            detail += f" {parked} parked lead{_plural(parked)} can be retried with Force."
+        return NextStep(
+            f"Enrich {counts['enrich']} lead{_plural(counts['enrich'])}",
+            detail,
+            "enrich",
+            "Open Enrich",
+            "info",
+        )
+    if counts["collect"] == 0:
+        return NextStep(
+            "Collect the first leads",
+            "Run a source stage to fill the database, then enrich them.",
+            "collect",
+            "Open Collect",
+            "info",
+        )
+    return NextStep(
+        "Nothing is waiting",
+        "No lead needs attention at any stage. Collect more, or check Tools.",
+        "pipeline",
+        "Refresh",
+        "ok",
+    )
+
+
+@dataclass(frozen=True)
+class Blocker:
+    """One precondition the CLI reports as blocked."""
+
+    stage: str
+    key: str
+    text: str
+    tone: str = "warn"
+
+
+def _stage_for_blocker(key: str) -> str:
+    for stage, keys in STAGE_BLOCKERS.items():
+        if key in keys:
+            return stage
+    return "pipeline"
+
+
+def blockers_for(payload: dict[str, Any], stage: str | None = None) -> list[Blocker]:
+    """Blocked preconditions, optionally only those one stage owns.
+
+    Reported only when ``status --json`` says ``blocked``: the GUI never
+    guesses, and the wording is the CLI's own.
+    """
+    blockers = payload.get("blockers")
+    if not isinstance(blockers, dict):
+        return []
+    keys = STAGE_BLOCKERS.get(stage, ()) if stage else tuple(blockers)
+    found: list[Blocker] = []
+    for key in keys:
+        info = blockers.get(key)
+        if not isinstance(info, dict) or not info.get("blocked"):
+            continue
+        found.append(
+            Blocker(
+                stage=_stage_for_blocker(key),
+                key=key,
+                text=str(info.get("detail") or key),
+            )
+        )
+    return found
+
+
+def funnel_line(payload: dict[str, Any]) -> str:
+    """``400 leads · 43 with a domain · 357 domainless · 3 parked``."""
+    funnel = payload.get("funnel")
+    if not isinstance(funnel, dict) or not funnel:
+        return ""
+    parts = [
+        f"{_count(funnel.get('collected'))} leads",
+        f"{_count(funnel.get('with_domain'))} with a domain",
+    ]
+    for key, label in (("domainless", "domainless"), ("parked", "parked"), ("done", "finished")):
+        count = _count(funnel.get(key))
+        if count:
+            parts.append(f"{count} {label}")
+    return " · ".join(parts)

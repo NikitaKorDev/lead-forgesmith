@@ -24,6 +24,8 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QStackedLayout,
     QTableWidget,
     QTableWidgetItem,
@@ -58,11 +60,164 @@ def tone_color(tone: str) -> str:
     return TONE_COLORS.get(tone, TONE_COLORS["muted"])
 
 
+def repolish(widget: QWidget) -> None:
+    """Re-apply the stylesheet after a dynamic property changed.
+
+    Qt resolves ``QPushButton#Stage[tone="waiting"]`` at polish time, so a
+    property flip without this leaves the old colours on screen.
+    """
+    style = widget.style()
+    style.unpolish(widget)
+    style.polish(widget)
+    widget.update()
+
+
 def muted(text: str) -> QLabel:
     label = QLabel(text)
     label.setObjectName("Hint")
     label.setWordWrap(True)
     return label
+
+
+class StageStrip(QFrame):
+    """The six pipeline stages as clickable segments with live counts.
+
+    One click per stage instead of a menu: the count on the segment is the
+    number of leads that stage's own CLI run would pick up.
+    """
+
+    page_selected = pyqtSignal(str)
+
+    def __init__(
+        self,
+        stages: tuple[tuple[str, str, str], ...],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("StageStrip")
+        self._stages = tuple(stages)
+        self._counts: dict[str, int] = {}
+        self._active = ""
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.buttons: dict[str, QPushButton] = {}
+        for page, _number, _label in self._stages:
+            button = QPushButton()
+            button.setObjectName("Stage")
+            button.setCursor(Qt.PointingHandCursor)
+            button.setProperty("tone", "clear")
+            button.setProperty("active", False)
+            button.clicked.connect(
+                lambda _checked=False, target=page: self.page_selected.emit(target)
+            )
+            self.buttons[page] = button
+            layout.addWidget(button, 1)
+        self.set_counts({page: 0 for page, _number, _label in self._stages})
+
+    def set_counts(self, counts: dict[str, int]) -> None:
+        self._counts = dict(counts)
+        for page, number, label in self._stages:
+            count = int(self._counts.get(page, 0) or 0)
+            button = self.buttons[page]
+            button.setText(f"{number}  {label}\n{count}")
+            button.setToolTip(f"{label}: {count} waiting")
+            button.setProperty("tone", "waiting" if count else "clear")
+            repolish(button)
+        self.set_active(self._active)
+
+    def set_active(self, page: str) -> None:
+        self._active = page if page in self.buttons else ""
+        for key, button in self.buttons.items():
+            button.setProperty("active", key == self._active)
+            repolish(button)
+
+    def counts(self) -> dict[str, int]:
+        return dict(self._counts)
+
+
+class NextStepCard(QFrame):
+    """The one action worth taking next, with the button that takes it."""
+
+    activated = pyqtSignal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("NextStep")
+        self.setProperty("tone", "info")
+        self._page = ""
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(14)
+
+        text = QVBoxLayout()
+        text.setSpacing(4)
+        caption = QLabel("NEXT STEP")
+        caption.setObjectName("NextStepCaption")
+        self.title = QLabel("Reading the pipeline…")
+        self.title.setObjectName("NextStepTitle")
+        self.title.setWordWrap(True)
+        self.detail = muted("")
+        text.addWidget(caption)
+        text.addWidget(self.title)
+        text.addWidget(self.detail)
+
+        self.button = QPushButton("Go")
+        self.button.setObjectName("Primary")
+        self.button.setMinimumWidth(150)
+        self.button.clicked.connect(self._emit)
+        self.button.setVisible(False)
+
+        layout.addLayout(text, 1)
+        layout.addWidget(self.button, 0, Qt.AlignVCenter)
+
+    def set_step(self, step: object) -> None:
+        """``step`` is a :class:`forgesmith.gui.payload.NextStep`."""
+        self._page = str(getattr(step, "page", "") or "")
+        self.title.setText(str(getattr(step, "title", "")))
+        self.detail.setText(str(getattr(step, "detail", "")))
+        self.button.setText(str(getattr(step, "action", "Go")))
+        self.button.setVisible(bool(self._page) and self._page != "pipeline")
+        self.setProperty("tone", str(getattr(step, "tone", "info")))
+        repolish(self)
+
+    def _emit(self) -> None:
+        if self._page:
+            self.activated.emit(self._page)
+
+
+class BlockerBanner(QFrame):
+    """The stage's own blocked preconditions, in the CLI's own words."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("BlockerBanner")
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(12, 10, 12, 10)
+        self._layout.setSpacing(4)
+        self.hide()
+
+    def set_blockers(self, blockers: list[object]) -> None:
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if not blockers:
+            self.hide()
+            return
+        heading = QLabel("Blocked")
+        heading.setObjectName("BlockerHeading")
+        self._layout.addWidget(heading)
+        for blocker in blockers:
+            label = QLabel("• " + str(getattr(blocker, "text", blocker)))
+            label.setObjectName("BlockerText")
+            label.setWordWrap(True)
+            self._layout.addWidget(label)
+        self.show()
 
 
 class KpiCard(QFrame):
@@ -110,21 +265,34 @@ class FormWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setHorizontalSpacing(12)
         layout.setVerticalSpacing(8)
-        layout.setColumnStretch(1, 1)
 
-        row = 0
+        # A long form (enrich, compose, send) would otherwise push its own Run
+        # button below the fold on a 900px screen. Two columns of controls use
+        # the width the window already has and halve the height.
+        columns = 2 if len(spec.fields) > 4 else 1
+        for index in range(columns):
+            layout.setColumnStretch(index * 2 + 1, 1)
+
+        row = column = 0
         for field in spec.fields:
             editor = self._make_editor(field)
+            if column >= columns:
+                row, column = row + 1, 0
             if field.kind == "bool":
-                layout.addWidget(editor, row, 0, 1, 2)
+                # Two checkboxes share a row: their own label is the caption.
+                layout.addWidget(editor, row, column * 2, 1, 2)
             else:
                 label = QLabel(field.label)
                 label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 if field.help:
                     label.setToolTip(field.help)
-                layout.addWidget(label, row, 0)
-                layout.addWidget(editor, row, 1)
-            row += 1
+                layout.addWidget(label, row, column * 2)
+                layout.addWidget(editor, row, column * 2 + 1)
+            column += 1
+        if columns > 1:
+            # Keep the label column narrow so the editors take the width.
+            for index in range(columns):
+                layout.setColumnMinimumWidth(index * 2, 90)
 
     # ------------------------------------------------------------ editors
     def _make_editor(self, field: Field) -> QWidget:
@@ -242,34 +410,60 @@ class CommandCard(QGroupBox):
 
     run_requested = pyqtSignal(object, object)  # spec, argv
 
-    def __init__(self, spec: Command, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        spec: Command,
+        parent: QWidget | None = None,
+        *,
+        scroll_body: bool = False,
+    ) -> None:
         super().__init__(spec.label, parent)
         self._spec = spec
+        # A card belongs in a page next to a table: let it take its natural
+        # height instead of stretching and starving the table below it.
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
+
+        self.body = QWidget()
+        body = QVBoxLayout(self.body)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(10)
         if spec.summary:
-            layout.addWidget(muted(spec.summary))
+            body.addWidget(muted(spec.summary))
 
         self.notice = QLabel(spec.notice or "")
         self.notice.setObjectName("Notice")
         self.notice.setWordWrap(True)
         self.notice.setVisible(bool(spec.notice))
-        layout.addWidget(self.notice)
+        body.addWidget(self.notice)
 
         self.form = FormWidget(spec)
         self.form.setVisible(bool(spec.fields))
-        layout.addWidget(self.form)
+        body.addWidget(self.form)
 
         self.error = QLabel("")
         self.error.setObjectName("Error")
         self.error.setWordWrap(True)
         self.error.setVisible(False)
-        layout.addWidget(self.error)
+        body.addWidget(self.error)
 
         # Keep the form tight against its summary; the spare height of a grid
         # row belongs between the form and the Run button, not inside it.
-        layout.addStretch(1)
+        body.addStretch(1)
+
+        if scroll_body:
+            # A page form can be taller than the space its splitter grants. Scroll
+            # the fields, never the Run button: the only way to start a stage must
+            # stay one click away on a short window.
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setWidget(self.body)
+            layout.addWidget(scroll, 1)
+        else:
+            layout.addWidget(self.body, 1)
 
         footer = QHBoxLayout()
         footer.addStretch(1)
@@ -511,6 +705,10 @@ class TablePane(QWidget):
         self._stack = QStackedLayout(self)
         self._stack.addWidget(self.placeholder)
         self._stack.addWidget(self.table)
+
+    def set_placeholder(self, text: str) -> None:
+        """Say what an empty table means for *this* page, not in general."""
+        self.placeholder.setText(text)
 
     def set_rows(self, rows: list[dict[str, Any]]) -> None:
         self.table.setSortingEnabled(False)

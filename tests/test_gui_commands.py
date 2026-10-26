@@ -15,13 +15,18 @@ from typer.testing import CliRunner
 from forgesmith import cli
 from forgesmith.gui import commands as gui
 from forgesmith.gui.payload import (
+    blockers_for,
     cell_text,
     doctor_headline,
     doctor_rows,
+    funnel_line,
     human_bytes,
+    next_step,
     parse_payload,
     rows_of,
+    rows_where_action,
     run_rows,
+    stage_counts,
     status_kpis,
     status_strip,
     window_text,
@@ -108,7 +113,12 @@ def test_empty_form_runs_the_bare_command() -> None:
 
 def test_declared_defaults_are_sent_explicitly() -> None:
     """The form shows the defaults, so argv should say what the form says."""
-    assert gui.build_argv(gui.command("enrich"), {}) == ["enrich", "--engine", "auto"]
+    assert gui.build_argv(gui.command("enrich"), {}) == [
+        "enrich",
+        "--engine",
+        "auto",
+        "--deep-resolve",
+    ]
     assert gui.build_argv(gui.command("backup"), {}) == [
         "backup",
         "--keep",
@@ -121,7 +131,7 @@ def test_blank_text_is_skipped_not_passed_through() -> None:
     argv = gui.build_argv(
         gui.command("enrich"), {"limit": None, "source": "", "lead_id": "  ", "engine": None}
     )
-    assert argv == ["enrich"]
+    assert argv == ["enrich", "--deep-resolve"]
 
 
 def test_numbers_are_validated_and_normalised() -> None:
@@ -189,9 +199,15 @@ def test_boolean_flags_are_emitted_only_when_true() -> None:
         "enrich",
         "--engine",
         "auto",
+        "--deep-resolve",
         "--force",
     ]
-    assert gui.build_argv(gui.command("enrich"), {"force": False}) == ["enrich", "--engine", "auto"]
+    assert gui.build_argv(gui.command("enrich"), {"force": False}) == [
+        "enrich",
+        "--engine",
+        "auto",
+        "--deep-resolve",
+    ]
 
 
 def test_negated_flag_is_emitted_when_a_default_true_box_is_cleared() -> None:
@@ -293,6 +309,115 @@ def test_rows_of_keeps_only_objects() -> None:
     assert rows_of({}) == []
 
 
+def test_rows_of_can_read_the_compose_check_key() -> None:
+    payload = {"eligible": 1, "leads": [{"lead_id": 4}, "junk"]}
+    assert rows_of(payload, "leads") == [{"lead_id": 4}]
+
+
+def test_rows_where_action_keeps_only_the_shared_eligibility_state() -> None:
+    payload = {
+        "rows": [
+            {"id": 1, "next_action": "enrich"},
+            {"id": 2, "next_action": "retry"},
+            {"id": 3, "next_action": "draft"},
+            {"id": 4},
+        ]
+    }
+    assert [row["id"] for row in rows_where_action(payload, ("enrich", "retry"))] == [1, 2]
+
+
+def test_stage_counts_read_the_funnel_and_the_inbox() -> None:
+    payload = {
+        "funnel": {
+            "collected": 400,
+            "enrichable": 389,
+            "composable": 2,
+            "drafted": 1,
+            "approved": 5,
+        },
+        "inbox": {"needs_review": 3},
+    }
+    assert stage_counts(payload) == {
+        "collect": 400,
+        "enrich": 389,
+        "draft": 2,
+        "approve": 1,
+        "send": 5,
+        "replies": 3,
+    }
+    assert stage_counts({}) == {
+        "collect": 0,
+        "enrich": 0,
+        "draft": 0,
+        "approve": 0,
+        "send": 0,
+        "replies": 0,
+    }
+
+
+def test_next_step_finishes_work_in_flight_before_pulling_more_through() -> None:
+    def funnel(**counts: int) -> dict:
+        base = {
+            "collected": 10,
+            "enrichable": 0,
+            "composable": 0,
+            "drafted": 0,
+            "approved": 0,
+            "parked": 0,
+        }
+        base.update(counts)
+        return {"funnel": base, "inbox": {}}
+
+    assert next_step(funnel(composable=2)).page == "draft"
+    assert next_step(funnel(composable=2, drafted=1)).page == "approve"
+    assert next_step(funnel(approved=3)).page == "send"
+    assert next_step(funnel(enrichable=9)).page == "enrich"
+    assert next_step({"funnel": {"collected": 0}, "inbox": {}}).page == "collect"
+    assert next_step({"funnel": {"collected": 4}, "inbox": {}}).tone == "ok"
+    replies = {"funnel": {"collected": 4}, "inbox": {"needs_review": 2}}
+    assert next_step(replies).page == "replies"
+    assert next_step({}).page == "pipeline"
+
+
+def test_next_step_names_the_counts_and_the_plural() -> None:
+    payload = {"funnel": {"collected": 3, "composable": 1, "parked": 2}, "inbox": {}}
+    step = next_step(payload)
+    assert step.title == "Draft 1 email"
+
+    enrich = {"funnel": {"collected": 3, "enrichable": 9, "parked": 2}, "inbox": {}}
+    step = next_step(enrich)
+    assert step.title == "Enrich 9 leads"
+    assert "2 parked leads" in step.detail
+
+    payload = {"funnel": {"collected": 3, "composable": 4}, "inbox": {}}
+    assert next_step(payload).title == "Draft 4 emails"
+
+
+def test_blockers_for_filters_by_the_stage_that_owns_them() -> None:
+    payload = {
+        "blockers": {
+            "kill_switch": {"blocked": True, "detail": "armed"},
+            "window": {"blocked": True, "detail": "closed"},
+            "ollama": {"blocked": False, "detail": "up"},
+            "sender": {"blocked": True, "detail": "no sender"},
+        }
+    }
+    assert [b.key for b in blockers_for(payload)] == ["kill_switch", "window", "sender"]
+    assert [b.key for b in blockers_for(payload, "send")] == ["kill_switch", "window"]
+    assert [b.key for b in blockers_for(payload, "draft")] == ["sender"]
+    assert blockers_for(payload, "enrich") == []
+    assert blockers_for({}) == []
+    assert blockers_for({"blockers": {"ollama": {"blocked": False}}}).__len__() == 0
+
+
+def test_funnel_line_summarises_the_database() -> None:
+    line = funnel_line(
+        {"funnel": {"collected": 400, "with_domain": 43, "domainless": 357, "parked": 3}}
+    )
+    assert line == "400 leads · 43 with a domain · 357 domainless · 3 parked"
+    assert funnel_line({}) == ""
+
+
 def test_status_kpis_summarise_the_pipeline() -> None:
     payload = {
         "leads": {"total": 7, "by_status": {"new": 5, "queued": 2}, "by_source": {"olx": 7}},
@@ -356,7 +481,10 @@ def test_doctor_headline_counts_failures_then_warnings() -> None:
     )
     assert failing.value == "1 failing" and failing.tone == "bad"
     warning = doctor_headline({"checks": [{"status": "warn"}, {"status": "ok"}]})
-    assert warning.value == "1 warning(s)" and warning.tone == "warn"
+    assert warning.value == "1 warning" and warning.tone == "warn"
+    assert doctor_headline({"checks": [{"status": "warn"}, {"status": "warn"}]}).value == (
+        "2 warnings"
+    )
     assert doctor_headline({"checks": [{"status": "ok"}]}).tone == "ok"
     assert doctor_headline({}).value == "not run"
     assert doctor_rows({"checks": [{"check": "db"}]}) == [{"check": "db"}]

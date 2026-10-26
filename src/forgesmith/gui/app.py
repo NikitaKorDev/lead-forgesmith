@@ -1,14 +1,23 @@
-"""Forgesmith desktop console: every stage, ledger and status in one window."""
+"""Forgesmith desktop console: a stage-strip pipeline over the real CLI.
+
+The GUI owns no pipeline logic. Every button builds argv, starts one
+``python -m forgesmith`` subprocess and shows its output, so approvals, the
+kill switch, dry-run gating, locks and the run ledger behave exactly as they do
+on the command line. What this window adds is *orientation*: one clickable
+stage strip with live counts, one "next step" card, and the blockers that would
+otherwise turn a run into a silent no-op.
+"""
 
 from __future__ import annotations
 
 import sys
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from PyQt5.QtCore import Qt, QTimer, QUrl
+from PyQt5.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QCloseEvent, QDesktopServices, QFont
 from PyQt5.QtWidgets import (
     QApplication,
@@ -18,7 +27,6 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
-    QListWidget,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -34,7 +42,6 @@ from PyQt5.QtWidgets import (
 
 from forgesmith import __version__
 from forgesmith.gui.commands import (
-    COMMANDS,
     LEAD_STATUSES,
     SOURCES,
     Command,
@@ -45,23 +52,33 @@ from forgesmith.gui.commands import (
     exit_tone,
 )
 from forgesmith.gui.payload import (
+    STAGES,
     Kpi,
+    blockers_for,
+    cell_text,
     doctor_headline,
     doctor_rows,
+    funnel_line,
+    next_step,
     rows_of,
+    rows_where_action,
     run_rows,
+    stage_counts,
     status_kpis,
-    status_strip,
     window_text,
 )
 from forgesmith.gui.runner import CliRunner, Result
 from forgesmith.gui.widgets import (
+    BlockerBanner,
     CommandCard,
     ConsolePane,
     KpiCard,
     MarkDialog,
+    NextStepCard,
+    StageStrip,
     TablePane,
     muted,
+    repolish,
     tone_color,
 )
 
@@ -75,6 +92,7 @@ QWidget {
 QLabel { background: transparent; }
 QMainWindow::separator { background: #e2e6ee; width: 1px; height: 1px; }
 QWidget#Header { background: #ffffff; border-bottom: 1px solid #e2e6ee; }
+QWidget#StageBar { background: #ffffff; border-bottom: 1px solid #e2e6ee; }
 QLabel#AppName { font-size: 13pt; font-weight: 700; color: #111827; }
 QLabel#AppTag { color: #6b7280; font-size: 9pt; }
 QLabel#PageTitle { font-size: 15pt; font-weight: 700; color: #111827; }
@@ -102,13 +120,40 @@ QGroupBox {
 QGroupBox::title {
     subcontrol-origin: margin; left: 12px; padding: 0 4px; color: #344054;
 }
-QListWidget#Nav {
-    background: #ffffff; border: 1px solid #e2e6ee; border-radius: 10px; padding: 6px;
-    outline: none;
+QFrame#StageStrip { background: transparent; }
+QPushButton#Stage {
+    background: #ffffff; border: 1px solid #e2e6ee; border-radius: 9px;
+    padding: 7px 12px; text-align: left; color: #6b7280; font-size: 9pt;
 }
-QListWidget#Nav::item { padding: 9px 10px; border-radius: 6px; color: #344054; }
-QListWidget#Nav::item:hover { background: #f1f4f9; }
-QListWidget#Nav::item:selected { background: #e8efff; color: #1d4ed8; font-weight: 600; }
+QPushButton#Stage:hover { border-color: #93b4f8; background: #f7f9fd; }
+QPushButton#Stage[tone="waiting"] {
+    border-color: #bfd3fb; background: #f4f8ff; color: #1d4ed8; font-weight: 600;
+}
+QPushButton#Stage[active="true"] {
+    border: 2px solid #2563eb; background: #ffffff; color: #1d4ed8; font-weight: 700;
+}
+QPushButton#StageTab {
+    background: #ffffff; border: 1px solid #e2e6ee; border-radius: 9px;
+    padding: 9px 14px; color: #475467;
+}
+QPushButton#StageTab:hover { border-color: #93b4f8; background: #f7f9fd; }
+QPushButton#StageTab[active="true"] {
+    border: 2px solid #2563eb; color: #1d4ed8; font-weight: 700;
+}
+QFrame#NextStep {
+    background: #ffffff; border: 1px solid #e2e6ee; border-left: 4px solid #2563eb;
+    border-radius: 10px;
+}
+QFrame#NextStep[tone="warn"] { border-left-color: #b45309; }
+QFrame#NextStep[tone="ok"] { border-left-color: #15803d; }
+QFrame#NextStep[tone="muted"] { border-left-color: #9aa3b2; }
+QLabel#NextStepCaption { color: #6b7280; font-size: 8pt; font-weight: 700; letter-spacing: 1px; }
+QLabel#NextStepTitle { font-size: 14pt; font-weight: 700; color: #111827; }
+QFrame#BlockerBanner {
+    background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px;
+}
+QLabel#BlockerHeading { color: #92400e; font-weight: 700; font-size: 9pt; }
+QLabel#BlockerText { color: #92400e; font-size: 9pt; }
 QLineEdit, QComboBox, QSpinBox {
     background: #ffffff; border: 1px solid #d5dae3; border-radius: 6px;
     padding: 5px 8px; min-height: 18px;
@@ -131,7 +176,7 @@ QPushButton#Primary:hover { background: #1d4ed8; }
 QPushButton#Primary:disabled { background: #b9cdf7; color: #eef2ff; }
 QPushButton#Danger { background: #b91c1c; border: none; color: #ffffff; font-weight: 600; }
 QPushButton#Danger:hover { background: #991b1b; }
-QPushButton#Danger:disabled { background: #f3d9d9; color: #c98a8a; }
+QPushButton#Danger:disabled { background: #eef1f6; color: #9aa3b2; border: 1px solid #e2e6ee; }
 QPushButton#Ghost {
     background: transparent; border: none; color: #94a3b8; padding: 3px 8px; font-size: 9pt;
 }
@@ -171,6 +216,13 @@ QScrollArea { border: none; background: transparent; }
 
 
 # --------------------------------------------------------------------- helpers
+def _counted(count: int, noun: str, plural: str | None = None) -> str:
+    """``1 lead`` / ``3 leads`` — a subtitle should not read like a template."""
+    if count == 1:
+        return f"{count} {noun}"
+    return f"{count} {plural or noun + 's'}"
+
+
 def _clear_layout(layout: QGridLayout) -> None:
     while layout.count():
         item = layout.takeAt(0)
@@ -190,11 +242,33 @@ def confirm_dialog(parent: QWidget, title: str, text: str) -> bool:
     return box.exec_() == QMessageBox.Yes
 
 
+def _page_header(title: str, subtitle: QLabel, refresh: Callable[[], Any]) -> QHBoxLayout:
+    """Title, live subtitle and the page's own Refresh button."""
+    head = QHBoxLayout()
+    label = QLabel(title)
+    label.setObjectName("PageTitle")
+    button = QPushButton("Refresh")
+    button.clicked.connect(refresh)
+    head.addWidget(label)
+    head.addWidget(subtitle, 1)
+    head.addWidget(button)
+    return head
+
+
 @dataclass
 class Ctx:
+    """What a page may do without knowing the window.
+
+    ``status`` returns the last ``status --json`` payload the window kept, and
+    ``refresh_status`` asks for a new one; pages never spawn their own status
+    poll, so the strip and the page always read the same snapshot.
+    """
+
     run: Callable[..., bool]
     navigate: Callable[..., None]
     notify: Callable[[str, str], None]
+    status: Callable[[], dict[str, Any]]
+    refresh_status: Callable[[], None]
 
 
 class Page(QWidget):
@@ -204,10 +278,43 @@ class Page(QWidget):
         super().__init__(parent)
         self.ctx = ctx
         self._loaded_at = 0.0
+        self._splitter: QSplitter | None = None
+        self._form: FormPane | None = None
+        self._table_min = 160
+        self._sized = False
 
     # ------------------------------------------------------------- lifecycle
     def refresh(self) -> None:
         """Override to load data. Marking freshness happens when a run starts."""
+
+    def attach_form(self, splitter: QSplitter, form: FormPane, table_min: int = 160) -> None:
+        """Budget the splitter for the form's real height once the theme is on.
+
+        A page is built before ``app.setStyleSheet`` runs, so measuring the card
+        in ``__init__`` under-reports its height and clips the Run button.
+        """
+        self._splitter = splitter
+        self._form = form
+        self._table_min = table_min
+
+    def showEvent(self, event: Any) -> None:
+        super().showEvent(event)
+        self.size_splitter()
+
+    def size_splitter(self) -> None:
+        if self._sized or self._splitter is None or self._form is None:
+            return
+        available = self._splitter.height()
+        if available < self._table_min + 160:
+            # Not laid out yet (first show); try again on the next resize.
+            return
+        self._sized = True
+        form_height = min(self._form.preferred_height(), available - self._table_min)
+        self._splitter.setSizes([form_height, available - form_height])
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        self.size_splitter()
 
     def note_loaded(self) -> None:
         """Record that data for this page is current (a run actually started)."""
@@ -215,6 +322,9 @@ class Page(QWidget):
 
     def on_result(self, result: Result) -> None:
         self.note_loaded()
+
+    def on_status(self, payload: dict[str, Any]) -> None:
+        """Called for every ``status --json`` payload the window receives."""
 
     def is_stale(self, seconds: float = 15.0) -> bool:
         return (time.monotonic() - self._loaded_at) > seconds
@@ -239,70 +349,56 @@ class Page(QWidget):
         return self.ctx.run(argv, owner=self)
 
 
-class CommandPage(Page):
-    """A single spec-driven form."""
+class FormPane(QWidget):
+    """A spec-driven command card in a scroll area, for the top of a stage page."""
 
-    def __init__(
-        self,
-        ctx: Ctx,
-        spec_id: str,
-        parent: QWidget | None = None,
-        extra: QWidget | None = None,
-    ) -> None:
-        super().__init__(ctx, parent)
+    run_requested = pyqtSignal(object, object)  # spec, argv
+
+    def __init__(self, spec: Command, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 8)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.card = CommandCard(spec, scroll_body=True)
+        self.card.run_requested.connect(lambda spec_, argv: self.run_requested.emit(spec_, argv))
+        layout.addWidget(self.card)
+        # Small enough that a short window can still show the table below; the
+        # page hands the splitter the card's natural height as the first size.
+        self.setMinimumHeight(160)
 
-        self.card = CommandCard(command(spec_id))
-        self.card.run_requested.connect(self._run)
+    def preferred_height(self) -> int:
+        """The card's natural height, so the splitter can budget for it."""
+        return min(self.card.sizeHint().height() + 12, 520)
 
-        host = QWidget()
-        host_layout = QVBoxLayout(host)
-        host_layout.setContentsMargins(0, 0, 0, 0)
-        host_layout.setSpacing(12)
-        if extra is not None:
-            host_layout.addWidget(extra)
-        host_layout.addWidget(self.card)
-        host_layout.addStretch(1)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setWidget(host)
-        layout.addWidget(scroll, 1)
-
-    def _run(self, spec: Command, argv: list[str]) -> None:
-        if self.ctx.run(argv, owner=self):
-            self.card.set_running(True)
-
-    def on_busy(self, busy: bool) -> None:
-        super().on_busy(busy)
-        if not busy:
-            self.card.set_running(False)
+    def set_running(self, running: bool) -> None:
+        self.card.set_running(running)
 
     def apply_values(self, values: dict[str, Any]) -> None:
         for key, value in values.items():
             self.card.form.set_value(key, value)
 
 
-# ------------------------------------------------------------------- dashboard
-class DashboardPage(Page):
+# ------------------------------------------------------------------- pipeline
+class PipelinePage(Page):
+    """The home page: what is waiting, what is blocked, and what to do next."""
+
     def __init__(self, ctx: Ctx, parent: QWidget | None = None) -> None:
         super().__init__(ctx, parent)
+        self._doctor_kpi: Kpi | None = None
+        self._want_doctor = False
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 8)
         layout.setSpacing(12)
 
-        head = QHBoxLayout()
-        title = QLabel("Pipeline")
-        title.setObjectName("PageTitle")
         self.subtitle = muted("reading status…")
-        refresh = QPushButton("Refresh")
-        refresh.clicked.connect(self.refresh)
-        head.addWidget(title)
-        head.addWidget(self.subtitle, 1)
-        head.addWidget(refresh)
-        layout.addLayout(head)
+        layout.addLayout(_page_header("Pipeline", self.subtitle, self.refresh))
+
+        self.next_card = NextStepCard()
+        self.next_card.activated.connect(lambda page: self.ctx.navigate(page))
+        layout.addWidget(self.next_card)
+
+        self.blockers = BlockerBanner()
+        layout.addWidget(self.blockers)
 
         self.cards_host = QWidget()
         self.cards = QGridLayout(self.cards_host)
@@ -313,8 +409,8 @@ class DashboardPage(Page):
             self.cards.setColumnStretch(column, 1)
         layout.addWidget(self.cards_host)
 
-        self.strip = muted("")
-        layout.addWidget(self.strip)
+        self.funnel = muted("")
+        layout.addWidget(self.funnel)
 
         self.doctor_table = TablePane("doctor")
         self.runs_table = TablePane("runs")
@@ -323,63 +419,63 @@ class DashboardPage(Page):
         tabs.addTab(self.runs_table, "Run ledger")
         layout.addWidget(tabs, 1)
 
-        self._doctor_kpi: Kpi | None = None
-        self._status: dict[str, Any] = {}
-
     def refresh(self) -> None:
         super().refresh()
-        if self.ctx.run(["status", "--json"], json_flag=True, owner=self):
-            self.ctx.notify("Reading pipeline status…", "info")
+        self._want_doctor = True
+        self.ctx.refresh_status()
+
+    def on_status(self, payload: dict[str, Any]) -> None:
+        if not payload:
+            return
+        self.next_card.set_step(next_step(payload))
+        self.blockers.set_blockers(blockers_for(payload))
+        self.funnel.setText(funnel_line(payload))
+        self.runs_table.set_rows(run_rows(payload))
+        database = str(payload.get("database") or "")
+        self.subtitle.setText(f"{database} · refreshed {time.strftime('%H:%M:%S')}")
+        self._fill_cards(payload)
+        if self._want_doctor:
+            self._want_doctor = False
+            self.ctx.run(["doctor", "--json"], json_flag=True, owner=self)
 
     def on_result(self, result: Result) -> None:
         super().on_result(result)
-        if not result.payload:
-            self.ctx.notify(f"{result.command_line} returned no JSON", "warn")
-            return
-        stage = result.argv[0]
-        if stage == "status":
-            self._status = result.payload
-            self._fill_cards()
-            self.runs_table.set_rows(run_rows(result.payload))
-            database = str(result.payload.get("database") or "")
-            self.subtitle.setText(f"{database} · refreshed {time.strftime('%H:%M:%S')}")
-            self.ctx.run(["doctor", "--json"], json_flag=True, owner=self)
-        elif stage == "doctor":
+        if result.argv[0] == "doctor" and result.payload:
             self._doctor_kpi = doctor_headline(result.payload)
-            self._fill_cards()
             self.doctor_table.set_rows(doctor_rows(result.payload))
+            self._fill_cards(self.ctx.status())
 
-    def _fill_cards(self) -> None:
+    def _fill_cards(self, payload: dict[str, Any]) -> None:
         _clear_layout(self.cards)
-        cards = status_kpis(self._status)
+        cards = status_kpis(payload)
         if self._doctor_kpi is not None:
             cards.insert(0, self._doctor_kpi)
         for index, kpi in enumerate(cards):
             self.cards.addWidget(
                 KpiCard(kpi.label, kpi.value, kpi.tone, kpi.hint), index // 4, index % 4
             )
-        self.strip.setText(status_strip(self._status))
 
 
-# ---------------------------------------------------------------------- leads
-class LeadsPage(Page):
+# -------------------------------------------------------------------- collect
+class CollectPage(Page):
+    """Where leads come from: the two sources, plus what they already stored."""
+
     def __init__(self, ctx: Ctx, parent: QWidget | None = None) -> None:
         super().__init__(ctx, parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 8)
+        layout.setSpacing(10)
 
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._leads_tab(), "Leads")
-        self.tabs.addTab(self._contacts_tab(), "Contacts")
-        self.tabs.currentChanged.connect(lambda _index: self.refresh())
-        layout.addWidget(self.tabs, 1)
+        self.subtitle = muted("newest leads in the database")
+        layout.addLayout(_page_header("1 · Collect", self.subtitle, self.refresh))
 
-    # ------------------------------------------------------------------ tabs
-    def _leads_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        sources = QHBoxLayout()
+        sources.setSpacing(10)
+        for spec_id in ("source_shopify", "source_olx"):
+            card = CommandCard(command(spec_id))
+            card.run_requested.connect(lambda _spec, argv: ctx.run(argv, owner=self))
+            sources.addWidget(card, 1)
+        layout.addLayout(sources)
 
         bar = QHBoxLayout()
         self.status_filter = QComboBox()
@@ -390,148 +486,232 @@ class LeadsPage(Page):
         self.source_filter.addItem("any source", None)
         for source in SOURCES:
             self.source_filter.addItem(source, source)
-        self.lead_limit = QSpinBox()
-        self.lead_limit.setRange(1, 5000)
-        self.lead_limit.setValue(200)
-        refresh = QPushButton("Refresh")
-        refresh.clicked.connect(lambda: self.refresh("leads"))
-        bar.addWidget(QLabel("Status"))
-        bar.addWidget(self.status_filter)
-        bar.addWidget(QLabel("Source"))
-        bar.addWidget(self.source_filter)
-        bar.addWidget(QLabel("Rows"))
-        bar.addWidget(self.lead_limit)
-        bar.addStretch(1)
-        bar.addWidget(refresh)
-        layout.addLayout(bar)
-
-        actions = QHBoxLayout()
-        for text, slot in (
-            ("Enrich…", self._enrich),
-            ("Compose…", self._compose),
-            ("Approve", self._approve),
-            ("Unapprove", self._unapprove),
-            ("Mark…", self._mark),
+        self.limit = QSpinBox()
+        self.limit.setRange(1, 5000)
+        self.limit.setValue(200)
+        for label, widget in (
+            ("Status", self.status_filter),
+            ("Source", self.source_filter),
+            ("Rows", self.limit),
         ):
-            button = QPushButton(text)
-            button.clicked.connect(slot)
-            actions.addWidget(button)
-        actions.addStretch(1)
-        layout.addLayout(actions)
-
-        self.leads_table = TablePane("leads")
-        self.leads_table.row_activated.connect(lambda _row: self._enrich())
-        layout.addWidget(self.leads_table, 1)
-        return tab
-
-    def _contacts_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-
-        bar = QHBoxLayout()
-        self.contact_limit = QSpinBox()
-        self.contact_limit.setRange(1, 5000)
-        self.contact_limit.setValue(300)
-        refresh = QPushButton("Refresh")
-        refresh.clicked.connect(lambda: self.refresh("contacts"))
-        bar.addWidget(QLabel("Rows"))
-        bar.addWidget(self.contact_limit)
+            bar.addWidget(QLabel(label))
+            bar.addWidget(widget)
         bar.addStretch(1)
-        bar.addWidget(refresh)
         layout.addLayout(bar)
 
-        self.contacts_table = TablePane("contacts")
-        layout.addWidget(self.contacts_table, 1)
-        return tab
+        self.table = TablePane("leads")
+        layout.addWidget(self.table, 1)
 
-    # --------------------------------------------------------------- refresh
-    def refresh(self, which: str | None = None) -> None:
+    def refresh(self) -> None:
         super().refresh()
-        which = which or ("leads" if self.tabs.currentIndex() == 0 else "contacts")
-        if which == "leads":
-            argv = ["leads", "--json", "--limit", str(self.lead_limit.value())]
-            status = self.status_filter.currentData()
-            source = self.source_filter.currentData()
-            if status:
-                argv += ["--status", str(status)]
-            if source:
-                argv += ["--source", str(source)]
-            self.ctx.run(argv, json_flag=True, owner=self)
-        else:
-            self.ctx.run(
-                ["contacts", "--json", "--limit", str(self.contact_limit.value())],
-                json_flag=True,
-                owner=self,
-            )
+        argv = ["leads", "--json", "--limit", str(self.limit.value())]
+        status = self.status_filter.currentData()
+        source = self.source_filter.currentData()
+        if status:
+            argv += ["--status", str(status)]
+        if source:
+            argv += ["--source", str(source)]
+        self.ctx.run(argv, json_flag=True, owner=self)
 
     def on_result(self, result: Result) -> None:
         super().on_result(result)
-        if not result.payload:
-            self.refresh()
-            return
-        if result.argv[0] == "leads":
-            self.leads_table.set_rows(rows_of(result.payload))
-        elif result.argv[0] == "contacts":
-            self.contacts_table.set_rows(rows_of(result.payload))
+        if result.argv[0] == "leads" and result.payload:
+            rows = rows_of(result.payload)
+            self.table.set_rows(rows)
+            total = result.payload.get("total")
+            self.subtitle.setText(f"{total} leads stored · showing the newest {len(rows)}")
 
-    # --------------------------------------------------------------- actions
-    def _selected(self) -> dict[str, Any] | None:
-        row = self.leads_table.current_row()
-        if row is None:
-            self.ctx.notify("Select a lead first.", "warn")
-        return row
-
-    def _enrich(self) -> None:
-        row = self._selected()
-        if row:
-            self.ctx.navigate("enrich", {"lead_id": row["id"]})
-
-    def _compose(self) -> None:
-        row = self._selected()
-        if row:
-            self.ctx.navigate("compose", {"lead_id": row["id"]})
-
-    def _approve(self) -> None:
-        row = self._selected()
-        if row:
-            self.confirm_run(command("approve"), {"lead_id": row["id"]})
-
-    def _unapprove(self) -> None:
-        row = self._selected()
-        if row:
-            self.confirm_run(command("unapprove"), {"lead_id": row["id"]})
-
-    def _mark(self) -> None:
-        row = self._selected()
-        if not row:
-            return
-        dialog = MarkDialog("Mark lead outcome", ("replied", "bounced", "sent", "suppressed"), self)
-        if dialog.exec_():
-            status, reason = dialog.values()
-            values: dict[str, Any] = {"lead_id": row["id"], "status": status}
-            if reason:
-                values["reason"] = reason
-            self.confirm_run(command("mark"), values)
+    def on_busy(self, busy: bool) -> None:
+        for button in self.findChildren(QPushButton):
+            button.setEnabled(not busy)
+        for card in self.findChildren(CommandCard):
+            card.set_running(busy)
 
 
-# --------------------------------------------------------------------- drafts
-class DraftsPage(Page):
+# --------------------------------------------------------------------- enrich
+class EnrichPage(Page):
+    """The enrichment queue and the addresses it has produced so far."""
+
     def __init__(self, ctx: Ctx, parent: QWidget | None = None) -> None:
         super().__init__(ctx, parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 8)
         layout.setSpacing(8)
 
+        self.subtitle = muted("leads waiting for a storefront")
+        layout.addLayout(_page_header("2 · Enrich", self.subtitle, self.refresh))
+
+        self.blockers = BlockerBanner()
+        layout.addWidget(self.blockers)
+
+        splitter = QSplitter(Qt.Vertical)
+        self.form = FormPane(command("enrich"))
+        self.form.run_requested.connect(self._run)
+        splitter.addWidget(self.form)
+
+        self.tabs = QTabWidget()
+        self.tabs.setMinimumHeight(170)
+        self.table = TablePane("leads")
+        self.table.set_placeholder("Nothing to enrich — every lead is drafted, parked or finished.")
+        self.contacts = TablePane("contacts")
+        self.tabs.addTab(self.table, "Queue")
+        self.tabs.addTab(self.contacts, "Contacts")
+        self.tabs.currentChanged.connect(lambda _index: self.refresh())
+        splitter.addWidget(self.tabs)
+        self.attach_form(splitter, self.form, table_min=200)
+        layout.addWidget(splitter, 1)
+
+        layout.addWidget(
+            muted(
+                "Deep resolve is ticked by default: without it, a lead whose shop "
+                "subdomain cannot be guessed is parked after a single attempt. "
+                "Parked leads stay in the queue — tick Force to retry them."
+            )
+        )
+
+    def refresh(self) -> None:
+        super().refresh()
+        if not self.ctx.status():
+            self.ctx.refresh_status()
+        if self.tabs.currentIndex() == 0:
+            self.ctx.run(["leads", "--json", "--limit", "500"], json_flag=True, owner=self)
+        else:
+            self.ctx.run(["contacts", "--json", "--limit", "300"], json_flag=True, owner=self)
+
+    def on_status(self, payload: dict[str, Any]) -> None:
+        self.blockers.set_blockers(blockers_for(payload, "enrich"))
+
+    def on_result(self, result: Result) -> None:
+        super().on_result(result)
+        if result.argv[0] == "leads" and result.payload:
+            rows = rows_where_action(result.payload, ("enrich", "retry"))
+            self.table.set_rows(rows)
+            awaiting = sum(1 for row in rows if row.get("next_action") == "enrich")
+            parked = len(rows) - awaiting
+            self.subtitle.setText(
+                f"{awaiting} awaiting enrichment"
+                + (f" · {parked} parked (tick Force to retry)" if parked else "")
+            )
+        elif result.argv[0] == "contacts" and result.payload:
+            self.contacts.set_rows(rows_of(result.payload))
+        elif result.argv[0] == "enrich":
+            self.ctx.refresh_status()
+            self.refresh()
+
+    def _run(self, _spec: Command, argv: list[str]) -> None:
+        if self.ctx.run(argv, owner=self):
+            self.form.set_running(True)
+
+    def on_busy(self, busy: bool) -> None:
+        super().on_busy(busy)
+        if not busy:
+            self.form.set_running(False)
+
+    def apply_values(self, values: dict[str, Any]) -> None:
+        self.form.apply_values(values)
+
+
+# ---------------------------------------------------------------------- draft
+class DraftPage(Page):
+    """Compose, with the eligibility preview the CLI's ``--check`` provides."""
+
+    def __init__(self, ctx: Ctx, parent: QWidget | None = None) -> None:
+        super().__init__(ctx, parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 8)
+        layout.setSpacing(8)
+
+        self.subtitle = muted("checking what is ready to draft…")
+        layout.addLayout(_page_header("3 · Draft", self.subtitle, self.refresh))
+
+        self.blockers = BlockerBanner()
+        layout.addWidget(self.blockers)
+
+        splitter = QSplitter(Qt.Vertical)
+        self.form = FormPane(command("compose"))
+        self.form.run_requested.connect(self._run)
+        splitter.addWidget(self.form)
+        self.preview = TablePane("compose_check")
+        self.preview.setMinimumHeight(170)
+        self.preview.set_placeholder(
+            "No lead is ready to draft — enrich first, or clear the blockers above."
+        )
+        splitter.addWidget(self.preview)
+        self.attach_form(splitter, self.form, table_min=170)
+        layout.addWidget(splitter, 1)
+
+        layout.addWidget(
+            muted(
+                "Compose needs the sender fields in .env and a running Ollama. "
+                "The table is `compose --check`: eligibility only, no model call."
+            )
+        )
+
+    def refresh(self) -> None:
+        super().refresh()
+        self.ctx.run(["compose", "--check", "--json"], json_flag=True, owner=self)
+
+    def on_status(self, payload: dict[str, Any]) -> None:
+        self.blockers.set_blockers(blockers_for(payload, "draft"))
+
+    def on_result(self, result: Result) -> None:
+        super().on_result(result)
+        if result.argv[:2] == ["compose", "--check"] and result.payload:
+            rows = rows_of(result.payload, "leads")
+            self.preview.set_rows(rows)
+            eligible = int(result.payload.get("eligible") or 0)
+            self.subtitle.setText(
+                f"{_counted(eligible, 'lead')} ready to draft · {len(rows)} checked"
+            )
+        elif result.argv[0] == "compose":
+            self.ctx.refresh_status()
+            self.refresh()
+
+    def _run(self, _spec: Command, argv: list[str]) -> None:
+        if self.ctx.run(argv, owner=self):
+            self.form.set_running(True)
+
+    def on_busy(self, busy: bool) -> None:
+        super().on_busy(busy)
+        if not busy:
+            self.form.set_running(False)
+
+    def apply_values(self, values: dict[str, Any]) -> None:
+        self.form.apply_values(values)
+
+
+# -------------------------------------------------------------------- approve
+class ApprovePage(Page):
+    """Read a draft, then approve it: the only human gate in the pipeline."""
+
+    def __init__(self, ctx: Ctx, parent: QWidget | None = None) -> None:
+        super().__init__(ctx, parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 8)
+        layout.setSpacing(8)
+
+        self.subtitle = muted("composed drafts wait here")
+        layout.addLayout(_page_header("4 · Approve", self.subtitle, self.refresh))
+        self._rows: list[dict[str, Any]] = []
+
         bar = QHBoxLayout()
         self.limit = QSpinBox()
         self.limit.setRange(1, 2000)
         self.limit.setValue(200)
-        refresh = QPushButton("Refresh")
-        refresh.clicked.connect(self.refresh)
         bar.addWidget(QLabel("Rows"))
         bar.addWidget(self.limit)
+        bar.addWidget(QLabel("Show"))
+        self.filter = QComboBox()
+        # `drafts` lists every message; this page is about the human gate, so it
+        # opens on the composed ones and keeps queued ones one click away.
+        for label, value in (
+            ("awaiting review", "composed"),
+            ("queued", "queued"),
+            ("all drafts", None),
+        ):
+            self.filter.addItem(label, value)
+        self.filter.currentIndexChanged.connect(lambda _index: self._fill())
+        bar.addWidget(self.filter)
         bar.addStretch(1)
         for text, slot in (
             ("Approve", self._approve),
@@ -542,7 +722,6 @@ class DraftsPage(Page):
             button = QPushButton(text)
             button.clicked.connect(slot)
             bar.addWidget(button)
-        bar.addWidget(refresh)
         layout.addLayout(bar)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -552,8 +731,10 @@ class DraftsPage(Page):
         self.detail.setReadOnly(True)
         splitter.addWidget(self.table)
         splitter.addWidget(self.detail)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        # Reviewing wording needs width: the body gets a real column, not a strip.
+        splitter.setSizes([700, 640])
         layout.addWidget(splitter, 1)
 
         self.table.row_selected.connect(self._show_detail)
@@ -568,10 +749,20 @@ class DraftsPage(Page):
 
     def on_result(self, result: Result) -> None:
         super().on_result(result)
-        if result.payload:
-            self.table.set_rows(rows_of(result.payload))
-        else:
+        if result.argv[0] == "drafts" and result.payload:
+            self._rows = rows_of(result.payload)
+            self._fill()
+        elif result.argv[0] in {"approve", "unapprove", "suppress"}:
+            self.ctx.refresh_status()
             self.refresh()
+
+    def _fill(self) -> None:
+        wanted = self.filter.currentData()
+        rows = [row for row in self._rows if wanted is None or row.get("lead_status") == wanted]
+        self.table.set_rows(rows)
+        composed = sum(1 for row in self._rows if row.get("lead_status") == "composed")
+        queued = sum(1 for row in self._rows if row.get("lead_status") == "queued")
+        self.subtitle.setText(f"{composed} awaiting review · {queued} queued · showing {len(rows)}")
 
     def _show_detail(self, row: object) -> None:
         if not isinstance(row, dict):
@@ -579,7 +770,8 @@ class DraftsPage(Page):
             return
         header = (
             f"lead {row.get('lead_id')} · message {row.get('message_id')} · "
-            f"{row.get('contact')} · {row.get('lead_status')}\n"
+            f"{row.get('contact')} · {row.get('lead_status')} · "
+            f"{cell_text(row.get('created_at'))}\n"
             f"subject: {row.get('subject')}\n"
             f"model: {row.get('model')} · prompt: {row.get('prompt_version')} · "
             f"footer: {row.get('footer_version')}\n\n"
@@ -626,37 +818,120 @@ class DraftsPage(Page):
         self.ctx.notify("Draft body copied to clipboard.", "ok")
 
 
-# -------------------------------------------------------------------- sources
-class SourcesPage(QWidget):
+# ----------------------------------------------------------------------- send
+class SendPage(Page):
+    """The approved queue, the sending policy and the send form."""
+
     def __init__(self, ctx: Ctx, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
+        super().__init__(ctx, parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 8)
+        layout.setSpacing(8)
+
+        self.subtitle = muted("reading policy…")
+        layout.addLayout(_page_header("5 · Send", self.subtitle, self.refresh))
+
+        self.blockers = BlockerBanner()
+        layout.addWidget(self.blockers)
+
+        splitter = QSplitter(Qt.Vertical)
+        self.form = FormPane(command("send"))
+        self.form.run_requested.connect(self._run)
+        splitter.addWidget(self.form)
+        self.queue = TablePane("leads")
+        self.queue.setMinimumHeight(130)
+        self.queue.set_placeholder("No approved mail waiting — approve a draft on stage 4 first.")
+        splitter.addWidget(self.queue)
+        self.attach_form(splitter, self.form, table_min=110)
+        layout.addWidget(splitter, 1)
+
+    def refresh(self) -> None:
+        super().refresh()
+        self.ctx.refresh_status()
+        self.ctx.run(
+            ["leads", "--json", "--status", "queued", "--limit", "200"], json_flag=True, owner=self
+        )
+
+    def on_status(self, payload: dict[str, Any]) -> None:
+        self.blockers.set_blockers(blockers_for(payload, "send"))
+        window = payload.get("window") or {}
+        cap = window.get("daily_cap") if isinstance(window, dict) else None
+        kill_switch = payload.get("kill_switch")
+        self.subtitle.setText(
+            f"kill switch: {kill_switch} · window: {window_text(window)}"
+            + (f" · daily cap {cap}" if cap is not None else "")
+        )
+
+    def on_result(self, result: Result) -> None:
+        super().on_result(result)
+        if result.argv[0] == "leads" and result.payload:
+            rows = rows_of(result.payload)
+            self.queue.set_rows(rows)
+        elif result.argv[0] == "send":
+            self.ctx.refresh_status()
+            self.refresh()
+
+    def _run(self, _spec: Command, argv: list[str]) -> None:
+        if self.ctx.run(argv, owner=self):
+            self.form.set_running(True)
+
+    def on_busy(self, busy: bool) -> None:
+        super().on_busy(busy)
+        if not busy:
+            self.form.set_running(False)
+
+    def apply_values(self, values: dict[str, Any]) -> None:
+        self.form.apply_values(values)
+
+
+# -------------------------------------------------------------------- replies
+class RepliesPage(Page):
+    """Read-only IMAP sync plus the inbound review ledger."""
+
+    def __init__(self, ctx: Ctx, parent: QWidget | None = None) -> None:
+        super().__init__(ctx, parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 8)
         layout.setSpacing(10)
 
-        head = QHBoxLayout()
-        title = QLabel("Sources")
-        title.setObjectName("PageTitle")
-        head.addWidget(title)
-        head.addWidget(muted("Marketplaces are a lead source, not a contact source."), 1)
-        layout.addLayout(head)
+        self.subtitle = muted("read-only IMAP: EXAMINE + BODY.PEEK")
+        layout.addLayout(_page_header("6 · Replies", self.subtitle, self.refresh))
 
-        cards = QWidget()
-        cards_layout = QVBoxLayout(cards)
-        cards_layout.setContentsMargins(0, 0, 0, 0)
-        cards_layout.setSpacing(10)
-        for spec in COMMANDS:
-            if spec.id in {"source_shopify", "source_olx"}:
-                card = CommandCard(spec)
-                card.run_requested.connect(lambda _spec, argv: ctx.run(argv, owner=self))
-                cards_layout.addWidget(card)
-        cards_layout.addStretch(1)
+        self.card = CommandCard(command("inbox_sync"))
+        self.card.run_requested.connect(lambda _spec, argv: ctx.run(argv, owner=self))
+        layout.addWidget(self.card)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setWidget(cards)
-        layout.addWidget(scroll, 1)
+        bar = QHBoxLayout()
+        for text, slot in (
+            ("Show", self._show),
+            ("Apply", self._apply),
+            ("Apply all", self._apply_all),
+        ):
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            bar.addWidget(button)
+        bar.addStretch(1)
+        layout.addLayout(bar)
+
+        self.table = TablePane("inbound")
+        layout.addWidget(self.table, 1)
+
+    def refresh(self) -> None:
+        super().refresh()
+        self.ctx.run(["inbox", "list", "--json", "--limit", "200"], json_flag=True, owner=self)
+
+    def on_result(self, result: Result) -> None:
+        super().on_result(result)
+        if result.argv[:2] == ["inbox", "list"] and result.payload:
+            rows = rows_of(result.payload)
+            self.table.set_rows(rows)
+            needs_review = sum(1 for row in rows if row.get("status") == "needs_review")
+            self.subtitle.setText(
+                f"{_counted(len(rows), 'inbound row')} · {needs_review} need review"
+            )
+        elif result.argv[:2] in (["inbox", "sync"], ["inbox", "apply"]):
+            self.ctx.refresh_status()
+            self.refresh()
 
     def on_busy(self, busy: bool) -> None:
         for button in self.findChildren(QPushButton):
@@ -664,123 +939,128 @@ class SourcesPage(QWidget):
         for card in self.findChildren(CommandCard):
             card.set_running(busy)
 
-
-# ------------------------------------------------------------------ enrichment
-class EnrichPage(CommandPage):
-    def __init__(self, ctx: Ctx, parent: QWidget | None = None) -> None:
-        note = QFrame()
-        note_layout = QVBoxLayout(note)
-        note_layout.setContentsMargins(0, 0, 0, 0)
-        note_layout.addWidget(
-            muted(
-                "Run with 'Resolve domains only' first to review OLX domains: it writes "
-                "enrichments.domain and leaves lead status untouched. Rerunning a "
-                "completed lead is a no-op unless you tick Force."
-            )
-        )
-        super().__init__(ctx, "enrich", parent, extra=note)
-
-
-# --------------------------------------------------------------------- compose
-class ComposePage(CommandPage):
-    def __init__(self, ctx: Ctx, parent: QWidget | None = None) -> None:
-        row = QWidget()
-        layout = QHBoxLayout(row)
-        layout.setContentsMargins(0, 0, 0, 0)
-        review = QPushButton("Review drafts →")
-        review.setObjectName("Primary")
-        review.clicked.connect(lambda: ctx.navigate("drafts"))
-        layout.addWidget(
-            muted(
-                "Compose needs the four sender fields in .env and a running Ollama. "
-                "Drafts are validated before they are stored; failures never downgrade "
-                "an existing draft."
-            ),
-            1,
-        )
-        layout.addWidget(review)
-        super().__init__(ctx, "compose", parent, extra=row)
-
-
-# ---------------------------------------------------------------------- mailer
-class MailerPage(CommandPage):
-    def __init__(self, ctx: Ctx, parent: QWidget | None = None) -> None:
-        policy = QWidget()
-        layout = QHBoxLayout(policy)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.policy_label = muted("reading policy…")
-        refresh = QPushButton("Refresh policy")
-        refresh.clicked.connect(self.refresh)
-        layout.addWidget(self.policy_label, 1)
-        layout.addWidget(refresh)
-        super().__init__(ctx, "send", parent, extra=policy)
-
-    def refresh(self) -> None:
-        super().refresh()
-        self.ctx.run(["status", "--json"], json_flag=True, owner=self)
-
-    def on_result(self, result: Result) -> None:
-        super().on_result(result)
-        if not result.payload or result.argv[0] != "status":
+    def _show(self) -> None:
+        row = self.table.current_row()
+        if not row:
+            self.ctx.notify("Select an inbound message first.", "warn")
             return
-        payload = result.payload
-        kill_switch = payload.get("kill_switch")
-        window = payload.get("window") or {}
-        cap = window.get("daily_cap")
-        self.policy_label.setText(
-            f"kill switch: {kill_switch} · window: {window_text(window)}"
-            + (f" · daily cap {cap}" if cap is not None else "")
-            + " · dry run writes .eml to data/outbox"
-        )
+        self.ctx.run(["inbox", "show", "--id", str(row["id"])], owner=self)
+
+    def _apply(self) -> None:
+        row = self.table.current_row()
+        if not row:
+            self.ctx.notify("Select an inbound message first.", "warn")
+            return
+        self.confirm_run(command("inbox_apply"), {"id": row["id"]})
+
+    def _apply_all(self) -> None:
+        self.confirm_run(command("inbox_apply"), {"all": True})
 
 
-# ---------------------------------------------------------------------- ledger
-class LedgerPage(Page):
+# ---------------------------------------------------------------------- tools
+class ToolsPage(Page):
+    """Ledger, maintenance and manual overrides, off the pipeline path."""
+
+    MAINTENANCE = (
+        "db_init",
+        "doctor",
+        "backup",
+        "mark",
+        "suppress",
+        "unsuppress",
+        "stats",
+        "version",
+    )
+
     def __init__(self, ctx: Ctx, parent: QWidget | None = None) -> None:
         super().__init__(ctx, parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 8)
+        layout.setSpacing(10)
+
+        self.subtitle = muted("ledger, maintenance and manual overrides")
+        layout.addLayout(_page_header("Tools", self.subtitle, self.refresh))
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._ledger_tab(), "Ledger")
+        self.tabs.addTab(self._maintenance_tab(), "Maintenance")
+        self.tabs.currentChanged.connect(lambda _index: self.refresh())
+        layout.addWidget(self.tabs, 1)
+
+    def _ledger_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
         bar = QHBoxLayout()
-        title = QLabel("Ledger")
-        title.setObjectName("PageTitle")
-        bar.addWidget(title)
         bar.addStretch(1)
         resolve = QPushButton("Resolve send…")
         resolve.clicked.connect(self._resolve)
         open_file = QPushButton("Open .eml")
         open_file.clicked.connect(self._open_eml)
-        refresh = QPushButton("Refresh")
-        refresh.clicked.connect(self.refresh)
         bar.addWidget(resolve)
         bar.addWidget(open_file)
-        bar.addWidget(refresh)
         layout.addLayout(bar)
 
         splitter = QSplitter(Qt.Vertical)
         self.sends_table = TablePane("sends")
+        self.sends_table.set_placeholder(
+            "No send attempt yet — a dry run writes .eml files to the outbox below."
+        )
         self.outbox_table = TablePane("outbox")
         splitter.addWidget(self.sends_table)
         splitter.addWidget(self.outbox_table)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([260, 360])
         layout.addWidget(splitter, 1)
+        return tab
+
+    def _maintenance_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        host = QWidget()
+        grid = QGridLayout(host)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        for index, spec_id in enumerate(self.MAINTENANCE):
+            card = CommandCard(command(spec_id))
+            card.run_requested.connect(lambda _spec, argv: self.ctx.run(argv, owner=self))
+            grid.addWidget(card, index // 2, index % 2)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(host)
+        layout.addWidget(scroll, 1)
+        return tab
 
     def refresh(self) -> None:
         super().refresh()
-        self.ctx.run(["sends", "--json", "--limit", "200"], json_flag=True, owner=self)
+        if self.tabs.currentIndex() == 0:
+            self.ctx.run(["sends", "--json", "--limit", "200"], json_flag=True, owner=self)
 
     def on_result(self, result: Result) -> None:
         super().on_result(result)
-        if not result.payload:
-            self.refresh()
-            return
-        if result.argv[0] == "sends":
+        if result.argv[0] == "sends" and result.payload:
             self.sends_table.set_rows(rows_of(result.payload))
             self.ctx.run(["outbox", "--json", "--limit", "200"], json_flag=True, owner=self)
-        elif result.argv[0] == "outbox":
+        elif result.argv[0] == "outbox" and result.payload:
             self.outbox_table.set_rows(rows_of(result.payload))
+        elif result.argv[0] in {"mark", "suppress", "unsuppress"}:
+            self.ctx.refresh_status()
+
+    def on_busy(self, busy: bool) -> None:
+        for button in self.findChildren(QPushButton):
+            button.setEnabled(not busy)
+        for card in self.findChildren(CommandCard):
+            card.set_running(busy)
 
     def _resolve(self) -> None:
         row = self.sends_table.current_row()
@@ -803,137 +1083,32 @@ class LedgerPage(Page):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(row["path"])))
 
 
-# ----------------------------------------------------------------------- inbox
-class InboxPage(Page):
-    def __init__(self, ctx: Ctx, parent: QWidget | None = None) -> None:
-        super().__init__(ctx, parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 8)
-        layout.setSpacing(10)
-
-        head = QHBoxLayout()
-        title = QLabel("Inbox")
-        title.setObjectName("PageTitle")
-        head.addWidget(title)
-        head.addWidget(
-            muted("Read-only IMAP: EXAMINE + BODY.PEEK. Nothing is marked seen or moved."), 1
-        )
-        layout.addLayout(head)
-
-        self.card = CommandCard(command("inbox_sync"))
-        self.card.run_requested.connect(lambda _spec, argv: ctx.run(argv, owner=self))
-        layout.addWidget(self.card)
-
-        bar = QHBoxLayout()
-        for text, slot in (
-            ("Show", self._show),
-            ("Apply", self._apply),
-            ("Apply all", self._apply_all),
-        ):
-            button = QPushButton(text)
-            button.clicked.connect(slot)
-            bar.addWidget(button)
-        bar.addStretch(1)
-        refresh = QPushButton("Refresh")
-        refresh.clicked.connect(self.refresh)
-        bar.addWidget(refresh)
-        layout.addLayout(bar)
-
-        self.table = TablePane("inbound")
-        layout.addWidget(self.table, 1)
-
-    def refresh(self) -> None:
-        super().refresh()
-        self.ctx.run(["inbox", "list", "--json", "--limit", "200"], json_flag=True, owner=self)
-
-    def on_result(self, result: Result) -> None:
-        super().on_result(result)
-        if result.argv[:2] == ["inbox", "list"]:
-            self.table.set_rows(rows_of(result.payload))
-        elif not result.payload:
-            self.refresh()
-
-    def _show(self) -> None:
-        row = self.table.current_row()
-        if not row:
-            self.ctx.notify("Select an inbound message first.", "warn")
-            return
-        self.ctx.run(["inbox", "show", "--id", str(row["id"])], owner=self)
-
-    def _apply(self) -> None:
-        row = self.table.current_row()
-        if not row:
-            self.ctx.notify("Select an inbound message first.", "warn")
-            return
-        self.confirm_run(command("inbox_apply"), {"id": row["id"]})
-
-    def _apply_all(self) -> None:
-        self.confirm_run(command("inbox_apply"), {"all": True})
-
-
-# ------------------------------------------------------------------- operations
-class OpsPage(QWidget):
-    def __init__(self, ctx: Ctx, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 8)
-        layout.setSpacing(10)
-
-        head = QHBoxLayout()
-        title = QLabel("Operations")
-        title.setObjectName("PageTitle")
-        head.addWidget(title)
-        head.addWidget(muted("Maintenance, audit and manual overrides."), 1)
-        layout.addLayout(head)
-
-        host = QWidget()
-        grid = QGridLayout(host)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(10)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-
-        order = (
-            "db_init",
-            "doctor",
-            "backup",
-            "mark",
-            "suppress",
-            "unsuppress",
-            "stats",
-            "version",
-        )
-        for index, spec_id in enumerate(order):
-            card = CommandCard(command(spec_id))
-            card.run_requested.connect(lambda _spec, argv: ctx.run(argv, owner=self))
-            grid.addWidget(card, index // 2, index % 2)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setWidget(host)
-        layout.addWidget(scroll, 1)
-
-    def on_busy(self, busy: bool) -> None:
-        for button in self.findChildren(QPushButton):
-            button.setEnabled(not busy)
-        for card in self.findChildren(CommandCard):
-            card.set_running(busy)
-
-
 # ------------------------------------------------------------------ main window
 NAV_PAGES: tuple[tuple[str, str], ...] = (
-    ("dashboard", "Dashboard"),
-    ("leads", "Prospects"),
-    ("drafts", "Drafts"),
-    ("sources", "Sources"),
-    ("enrich", "Enrichment"),
-    ("compose", "Compose"),
-    ("mailer", "Mailer"),
-    ("ledger", "Ledger"),
-    ("inbox", "Inbox"),
-    ("ops", "Operations"),
+    ("pipeline", "Pipeline"),
+    ("collect", "1 · Collect"),
+    ("enrich", "2 · Enrich"),
+    ("draft", "3 · Draft"),
+    ("approve", "4 · Approve"),
+    ("send", "5 · Send"),
+    ("replies", "6 · Replies"),
+    ("tools", "Tools"),
+)
+
+#: Stages whose completion can change the funnel, so the strip is re-read.
+MUTATING_STAGES = frozenset(
+    {
+        "source",
+        "enrich",
+        "compose",
+        "approve",
+        "unapprove",
+        "send",
+        "inbox",
+        "mark",
+        "suppress",
+        "unsuppress",
+    }
 )
 
 
@@ -948,44 +1123,43 @@ class MainWindow(QMainWindow):
         self.runner.chunk.connect(self._on_chunk)
         self.runner.finished.connect(self._on_finished)
 
-        self.ctx = Ctx(run=self.run_stage, navigate=self.navigate, notify=self.notify)
+        self._status: dict[str, Any] = {}
+        self._queue: deque[tuple[list[str], bool, Page | None]] = deque()
         self._owner: Page | None = None
+        self.ctx = Ctx(
+            run=self.run_stage,
+            navigate=self.navigate,
+            notify=self.notify,
+            status=lambda: self._status,
+            refresh_status=self.refresh_status,
+        )
 
         central = QWidget()
         outer = QVBoxLayout(central)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         outer.addWidget(self._header())
+        outer.addWidget(self._stage_bar())
 
-        body = QWidget()
-        body_layout = QHBoxLayout(body)
-        body_layout.setContentsMargins(12, 12, 12, 12)
-        body_layout.setSpacing(12)
-
-        self.nav = QListWidget()
-        self.nav.setObjectName("Nav")
-        self.nav.setFixedWidth(186)
         self.stack = QStackedWidget()
-
         self.pages: dict[str, Any] = {
-            "dashboard": DashboardPage(self.ctx),
-            "leads": LeadsPage(self.ctx),
-            "drafts": DraftsPage(self.ctx),
-            "sources": SourcesPage(self.ctx),
+            "pipeline": PipelinePage(self.ctx),
+            "collect": CollectPage(self.ctx),
             "enrich": EnrichPage(self.ctx),
-            "compose": ComposePage(self.ctx),
-            "mailer": MailerPage(self.ctx),
-            "ledger": LedgerPage(self.ctx),
-            "inbox": InboxPage(self.ctx),
-            "ops": OpsPage(self.ctx),
+            "draft": DraftPage(self.ctx),
+            "approve": ApprovePage(self.ctx),
+            "send": SendPage(self.ctx),
+            "replies": RepliesPage(self.ctx),
+            "tools": ToolsPage(self.ctx),
         }
-        for page_id, label in NAV_PAGES:
-            self.nav.addItem(label)
+        for page_id, _label in NAV_PAGES:
             self.stack.addWidget(self.pages[page_id])
         self._page_ids = [page_id for page_id, _label in NAV_PAGES]
 
-        body_layout.addWidget(self.nav)
-        body_layout.addWidget(self.stack, 1)
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(12, 12, 12, 12)
+        body_layout.addWidget(self.stack)
         outer.addWidget(body, 1)
         self.setCentralWidget(central)
 
@@ -998,10 +1172,10 @@ class MainWindow(QMainWindow):
         # "Console" caption in the platform's default (light) styling.
         dock.setTitleBarWidget(QWidget())
         self.addDockWidget(Qt.BottomDockWidgetArea, dock)
-        self.resizeDocks([dock], [230], Qt.Vertical)
+        self.resizeDocks([dock], [180], Qt.Vertical)
 
-        self.nav.currentRowChanged.connect(self._on_nav)
-        self.nav.setCurrentRow(0)
+        self.stack.setCurrentIndex(0)
+        self._sync_nav("pipeline")
         self.statusBar().showMessage("Ready")
 
         self._timer = QTimer(self)
@@ -1009,7 +1183,7 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._auto_refresh)
         self._timer.start()
 
-        QTimer.singleShot(200, self.pages["dashboard"].refresh)
+        QTimer.singleShot(200, self._startup)
 
     # ------------------------------------------------------------------ chrome
     def _header(self) -> QWidget:
@@ -1039,6 +1213,33 @@ class MainWindow(QMainWindow):
         layout.addWidget(refresh)
         return header
 
+    def _stage_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("StageBar")
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
+
+        self._extra_nav: dict[str, QPushButton] = {}
+        pipeline = self._tab_button("pipeline", "Pipeline")
+        layout.addWidget(pipeline)
+
+        self.strip = StageStrip(STAGES)
+        self.strip.page_selected.connect(lambda page: self.navigate(page))
+        layout.addWidget(self.strip, 1)
+
+        layout.addWidget(self._tab_button("tools", "Tools"))
+        return bar
+
+    def _tab_button(self, page_id: str, text: str) -> QPushButton:
+        button = QPushButton(text)
+        button.setObjectName("StageTab")
+        button.setCursor(Qt.PointingHandCursor)
+        button.setProperty("active", False)
+        button.clicked.connect(lambda _checked=False, target=page_id: self.navigate(target))
+        self._extra_nav[page_id] = button
+        return button
+
     # ------------------------------------------------------------------- runs
     def run_stage(
         self,
@@ -1047,9 +1248,25 @@ class MainWindow(QMainWindow):
         json_flag: bool = False,
         owner: Page | None = None,
     ) -> bool:
-        if self.runner.busy:
-            self.notify("A stage is already running — wait or press Stop.", "warn")
-            return False
+        """Start one stage, or queue it behind the running one.
+
+        The queue is what makes a chain like enrich -> status -> compose safe:
+        one process at a time, in the order the pages asked for them.
+        """
+        if self.runner.busy or self._queue:
+            self._queue.append((list(argv), json_flag, owner))
+            if owner is not None and argv[:1] != ["status"]:
+                self.notify(f"Queued ({len(self._queue)}): forgesmith {' '.join(argv)}", "info")
+            return True
+        return self._start(list(argv), json_flag=json_flag, owner=owner)
+
+    def _start(
+        self,
+        argv: list[str],
+        *,
+        json_flag: bool = False,
+        owner: Page | None = None,
+    ) -> bool:
         self._owner = owner
         self.console.begin("forgesmith " + " ".join(argv))
         self._set_busy(True)
@@ -1057,11 +1274,28 @@ class MainWindow(QMainWindow):
         if not started:
             self._set_busy(False)
             self.notify("Could not start the stage.", "bad")
-        else:
-            note = getattr(owner, "note_loaded", None)
-            if callable(note):
-                note()
-        return started
+            return False
+        note = getattr(owner, "note_loaded", None)
+        if callable(note):
+            note()
+        return True
+
+    def refresh_status(self) -> None:
+        """Ask for a fresh ``status --json`` unless one is already in flight."""
+        if self.runner.busy and self.runner.argv[:1] == ["status"]:
+            return
+        if any(item[0][:1] == ["status"] for item in self._queue):
+            return
+        self.run_stage(["status", "--json"], json_flag=True, owner=None)
+
+    def _apply_status(self, payload: dict[str, Any]) -> None:
+        """Keep one snapshot for the strip and every page that wants it."""
+        self._status = payload
+        self.strip.set_counts(stage_counts(payload))
+        for page in self.pages.values():
+            handler = getattr(page, "on_status", None)
+            if callable(handler):
+                self._safe(handler, payload)
 
     def _on_started(self, command_line: str) -> None:
         self.statusBar().showMessage(f"Running {command_line}…")
@@ -1074,27 +1308,41 @@ class MainWindow(QMainWindow):
         owner, self._owner = self._owner, None
         self._set_busy(False)
 
+        if result.argv[:1] == ["status"] and result.payload:
+            self._safe(self._apply_status, result.payload)
+
         if owner is not None and hasattr(owner, "on_result"):
             try:
                 owner.on_result(result)
             except Exception as exc:  # a page bug must not kill the console
                 self.console.append(f"\n[gui] {type(exc).__name__}: {exc}\n", "err")
 
-        if not self.runner.busy:
-            self._set_busy(False)
+        if result.argv[:1] != ["status"]:
             label, tone = exit_tone(result.exit_code)
             self.notify(f"{result.command_line} → {label} ({result.duration_s}s)", tone)
-            current = self.stack.currentWidget()
-            for page in self.pages.values():
-                if page is not owner and page is not current and hasattr(page, "mark_stale"):
-                    page.mark_stale()
-            # A page opened while another stage was running had its refresh
-            # refused, so it would sit on its placeholder until F5. Pick it up
-            # now that the runner is free.
-            if current is not owner and getattr(current, "is_stale", lambda: False)():
-                self._safe(current.refresh)
+            if not result.cancelled and result.argv[:1] and result.argv[0] in MUTATING_STAGES:
+                self._safe(self.refresh_status)
+
+        current = self.stack.currentWidget()
+        for page in self.pages.values():
+            if page is not owner and page is not current and hasattr(page, "mark_stale"):
+                page.mark_stale()
+
+        if self._queue:
+            argv, json_flag, queued_owner = self._queue.popleft()
+            self._start(argv, json_flag=json_flag, owner=queued_owner)
+            return
+
+        self._set_busy(False)
+        # A page opened while another stage was running had its refresh
+        # refused, so it would sit on its placeholder until F5. Pick it up now.
+        if current is not owner and getattr(current, "is_stale", lambda: False)():
+            self._safe(current.refresh)
 
     def _stop(self) -> None:
+        if self._queue:
+            self._queue.clear()
+            self.notify("Cleared the queued stages.", "warn")
         if self.runner.busy:
             self.notify("Cancelling the running stage…", "warn")
             self.runner.cancel()
@@ -1109,29 +1357,34 @@ class MainWindow(QMainWindow):
     def navigate(self, page_id: str, values: dict[str, Any] | None = None) -> None:
         if page_id not in self._page_ids:
             return
-        self.nav.setCurrentRow(self._page_ids.index(page_id))
+        self.stack.setCurrentIndex(self._page_ids.index(page_id))
+        self._sync_nav(page_id)
         page = self.pages[page_id]
         if values and hasattr(page, "apply_values"):
             page.apply_values(values)
-
-    def _on_nav(self, row: int) -> None:
-        if row < 0:
-            return
-        self.stack.setCurrentIndex(row)
-        page = self.stack.currentWidget()
-        if hasattr(page, "is_stale") and page.is_stale():
+        if getattr(page, "is_stale", lambda: False)():
             self._safe(page.refresh)
+
+    def _sync_nav(self, page_id: str) -> None:
+        self.strip.set_active(page_id)
+        for key, button in self._extra_nav.items():
+            button.setProperty("active", key == page_id)
+            repolish(button)
 
     def _refresh_current(self) -> None:
         page = self.stack.currentWidget()
         if hasattr(page, "refresh"):
             self._safe(page.refresh)
+        self.refresh_status()
 
     def _auto_refresh(self) -> None:
-        if self.runner.busy:
+        if self.runner.busy or self._queue:
             return
-        if self.stack.currentWidget() is self.pages["dashboard"]:
-            self._safe(self.pages["dashboard"].refresh)
+        if self.stack.currentWidget() is self.pages["pipeline"]:
+            self._safe(self.pages["pipeline"].refresh)
+
+    def _startup(self) -> None:
+        self._safe(self.pages["pipeline"].refresh)
 
     def _safe(self, action: Callable[..., Any], *args: Any) -> None:
         """Run a slot body; PyQt5 aborts the process on unhandled slot errors."""
@@ -1158,6 +1411,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             self.runner.cancel()
+        self._queue.clear()
         event.accept()
 
 
