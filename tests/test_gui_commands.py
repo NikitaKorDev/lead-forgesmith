@@ -15,6 +15,8 @@ from typer.testing import CliRunner
 from forgesmith import cli
 from forgesmith.gui import commands as gui
 from forgesmith.gui.payload import (
+    action_argv,
+    action_page,
     blockers_for,
     cell_text,
     doctor_headline,
@@ -324,6 +326,40 @@ def test_rows_where_action_keeps_only_the_shared_eligibility_state() -> None:
         ]
     }
     assert [row["id"] for row in rows_where_action(payload, ("enrich", "retry"))] == [1, 2]
+
+
+def test_action_argv_turns_a_state_into_the_stage_command() -> None:
+    """One click per row: the shared state names the action, this names the argv."""
+    assert action_argv({"id": 7, "next_action": "enrich"}) == [
+        "enrich",
+        "--deep-resolve",
+        "--lead-id",
+        "7",
+    ]
+    assert action_argv({"id": 7, "next_action": "retry"}) == [
+        "enrich",
+        "--deep-resolve",
+        "--force",
+        "--lead-id",
+        "7",
+    ]
+    assert action_argv({"id": 7, "next_action": "draft"}) == ["compose", "--lead-id", "7"]
+
+
+def test_action_argv_is_empty_when_there_is_nothing_to_run() -> None:
+    # review/send are pages, not commands; a finished lead has no action at all.
+    assert action_argv({"id": 7, "next_action": "review"}) == []
+    assert action_argv({"id": 7, "next_action": "send"}) == []
+    assert action_argv({"id": 7, "next_action": "done"}) == []
+    assert action_argv({"next_action": "enrich"}) == []
+    assert action_argv({"id": 7}) == []
+
+
+def test_action_page_opens_the_page_that_owns_the_gate() -> None:
+    assert action_page({"next_action": "review"}) == "approve"
+    assert action_page({"next_action": "send"}) == "send"
+    assert action_page({"next_action": "enrich"}) == ""
+    assert action_page({}) == ""
 
 
 def test_stage_counts_read_the_funnel_and_the_inbox() -> None:

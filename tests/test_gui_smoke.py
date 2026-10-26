@@ -18,8 +18,9 @@ pytest.importorskip("PyQt5.QtWidgets")
 from PyQt5.QtCore import QByteArray
 from PyQt5.QtWidgets import QApplication
 
+from forgesmith.gui import app as gui_app
 from forgesmith.gui import commands as gui
-from forgesmith.gui.app import NAV_PAGES, STYLESHEET, MainWindow
+from forgesmith.gui.app import NAV_PAGES, STYLESHEET, MainWindow, Step
 from forgesmith.gui.runner import CliRunner, Result
 from forgesmith.gui.widgets import CommandCard
 
@@ -41,14 +42,22 @@ class _StubWindow(MainWindow):
 
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], bool]] = []
+        self.chains: list[list[Step]] = []
         super().__init__()
 
-    def run_stage(self, argv, *, json_flag=False, owner=None):  # type: ignore[override]
-        self.calls.append((list(argv), json_flag))
+    def run_chain(self, steps, *, owner=None):  # type: ignore[override]
+        steps = list(steps)
+        self.chains.append(steps)
+        self.calls.extend((list(step.argv), step.json_flag) for step in steps)
         note = getattr(owner, "note_loaded", None)
         if callable(note):
             note()
         return True
+
+    def run_stage(self, argv, *, json_flag=False, owner=None, followup=None):  # type: ignore[override]
+        return self.run_chain(
+            [Step(list(argv), json_flag=json_flag, followup=followup)], owner=owner
+        )
 
 
 @pytest.fixture()
@@ -190,3 +199,165 @@ def test_choice_fields_offer_an_empty_option_unless_required() -> None:
     status = mark.form._editors["status"]
     assert status.count() == 5
     assert status.itemData(0) == "replied"  # required: no blank entry
+
+
+# ---------------------------------------------------------------- bulk actions
+def _result(argv: list[str], payload: dict[str, object]) -> Result:
+    return Result(
+        argv=list(argv),
+        exit_code=0,
+        duration_s=0.2,
+        stdout="",
+        stderr="",
+        payload=dict(payload),
+    )
+
+
+def test_drafting_one_lead_checks_then_enriches_at_most_once(window: _StubWindow) -> None:
+    """The silent `scanned 0` was the bug: a lead id must explain itself first."""
+    page = window.pages["draft"]
+    page.draft_lead(42)
+
+    step = window.chains[-1][0]
+    assert step.argv == ["compose", "--check", "--json", "--lead-id", "42"]
+    assert step.json_flag is True
+
+    needs_enrichment = _result(
+        step.argv,
+        {"leads": [{"lead_id": 42, "next_action": "enrich", "reason": "no domain yet"}]},
+    )
+    chained = step.followup(needs_enrichment)
+    assert [item.argv for item in chained] == [
+        ["enrich", "--lead-id", "42", "--deep-resolve"],
+        ["compose", "--check", "--json", "--lead-id", "42"],
+    ]
+
+    recheck = chained[1]
+    ready = _result(recheck.argv, {"leads": [{"lead_id": 42, "next_action": "draft"}]})
+    assert [item.argv for item in recheck.followup(ready)] == [["compose", "--lead-id", "42"]]
+
+    # Still not enrichable after one attempt: compose and let the CLI say why.
+    still_parked = _result(recheck.argv, {"leads": [{"lead_id": 42, "next_action": "enrich"}]})
+    assert [item.argv for item in recheck.followup(still_parked)] == [
+        ["compose", "--lead-id", "42"]
+    ]
+
+
+def test_the_draft_form_routes_a_single_lead_through_the_chain(window: _StubWindow) -> None:
+    page = window.pages["draft"]
+
+    page._run(gui.command("compose"), ["compose", "--lead-id", "9"])
+    assert window.chains[-1][0].argv == ["compose", "--check", "--json", "--lead-id", "9"]
+
+    # The operator's own flags survive the detour through the check.
+    page._run(gui.command("compose"), ["compose", "--lead-id", "9", "--regenerate"])
+    step = window.chains[-1][0]
+    assert step.argv == ["compose", "--check", "--json", "--lead-id", "9", "--regenerate"]
+    ready = _result(step.argv, {"leads": [{"lead_id": 9, "next_action": "draft"}]})
+    assert [item.argv for item in step.followup(ready)] == [
+        ["compose", "--lead-id", "9", "--regenerate"]
+    ]
+
+    # A batch run is the plain command: the chain only exists for one lead.
+    page._run(gui.command("compose"), ["compose", "--limit", "5"])
+    assert window.calls[-1][0] == ["compose", "--limit", "5"]
+
+
+def test_enrich_bulk_buttons_pass_a_limit_and_keep_deep_resolve(window: _StubWindow) -> None:
+    page = window.pages["enrich"]
+
+    page._enrich(25)
+    assert window.calls[-1][0] == ["enrich", "--deep-resolve", "--limit", "25"]
+
+    page._enrich(None)
+    assert window.calls[-1][0] == ["enrich", "--deep-resolve"]
+
+
+def test_retry_parked_forces_only_the_parked_leads(window: _StubWindow) -> None:
+    """--force on its own would re-crawl the whole enriched backlog."""
+    page = window.pages["enrich"]
+    page._rows = [
+        {"id": 3, "next_action": "retry"},
+        {"id": 4, "next_action": "enrich"},
+        {"id": 5, "next_action": "retry"},
+    ]
+
+    page._retry_parked()
+
+    assert [step.argv for step in window.chains[-1]] == [
+        ["enrich", "--lead-id", "3", "--deep-resolve", "--force"],
+        ["enrich", "--lead-id", "5", "--deep-resolve", "--force"],
+    ]
+
+
+def test_approve_all_lists_what_it_will_approve(
+    window: _StubWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prompts: list[str] = []
+
+    def fake_confirm(_parent: object, _title: str, text: str) -> bool:
+        prompts.append(text)
+        return True
+
+    monkeypatch.setattr(gui_app, "confirm_dialog", fake_confirm)
+    page = window.pages["approve"]
+    page._rows = [
+        {
+            "lead_id": 1,
+            "message_id": 10,
+            "lead_status": "composed",
+            "company": "a.pl",
+            "contact": "x@a.pl",
+            "subject": "Wspolpraca",
+        },
+        {
+            "lead_id": 2,
+            "message_id": 11,
+            "lead_status": "queued",
+            "company": "b.pl",
+            "contact": "y@b.pl",
+            "subject": "Already approved",
+        },
+    ]
+
+    page._approve_all()
+
+    assert "x@a.pl" in prompts[0] and "y@b.pl" not in prompts[0]
+    assert window.calls[-1][0] == ["approve", "--all-composed", "--yes", "--limit", "1"]
+
+
+def test_send_live_shows_recipients_and_dry_run_never_goes_live(
+    window: _StubWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prompts: list[str] = []
+
+    def fake_confirm(_parent: object, _title: str, text: str) -> bool:
+        prompts.append(text)
+        return True
+
+    monkeypatch.setattr(gui_app, "confirm_dialog", fake_confirm)
+    page = window.pages["send"]
+    page._drafts = [
+        {"lead_id": 5, "company": "c.pl", "contact": "z@c.pl", "lead_status": "queued"},
+        {"lead_id": 6, "company": "d.pl", "contact": "w@d.pl", "lead_status": "composed"},
+    ]
+    page.batch.setValue(3)
+
+    page._dry_run()
+    assert "--live" not in window.calls[-1][0]
+
+    page._send_live()
+    assert "z@c.pl" in prompts[0] and "w@d.pl" not in prompts[0]
+    assert window.calls[-1][0] == ["send", "--live", "--yes", "--limit", "3"]
+
+
+def test_send_live_is_skipped_when_the_operator_cancels(
+    window: _StubWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gui_app, "confirm_dialog", lambda *_args: False)
+    page = window.pages["send"]
+    before = len(window.calls)
+
+    page._send_live()
+
+    assert len(window.calls) == before

@@ -60,6 +60,36 @@ def rows_where_action(payload: dict[str, Any], actions: tuple[str, ...]) -> list
     return [row for row in rows_of(payload) if row.get("next_action") in wanted]
 
 
+#: The command a row's single next action runs, before ``--lead-id``.
+#: ``review`` and ``send`` are pages, not commands: see :data:`ACTION_PAGES`.
+ACTION_COMMANDS: dict[str, tuple[str, ...]] = {
+    "enrich": ("enrich", "--deep-resolve"),
+    "retry": ("enrich", "--deep-resolve", "--force"),
+    "draft": ("compose",),
+}
+
+#: Where a row's next action lives when it is a page rather than a command.
+ACTION_PAGES: dict[str, str] = {"review": "approve", "send": "send"}
+
+
+def action_argv(row: dict[str, Any], key: str = "id") -> list[str]:
+    """The argv for one lead row's next action, or ``[]`` when it has none.
+
+    The action itself comes from the shared eligibility map, so this only turns
+    a name into flags: the GUI never decides *whether* a lead is actionable.
+    """
+    action = str(row.get("next_action") or "")
+    lead_id = row.get(key)
+    if action not in ACTION_COMMANDS or lead_id in (None, ""):
+        return []
+    return [*ACTION_COMMANDS[action], "--lead-id", str(lead_id)]
+
+
+def action_page(row: dict[str, Any]) -> str:
+    """The page a row's next action opens, or ``""`` when it runs a command."""
+    return ACTION_PAGES.get(str(row.get("next_action") or ""), "")
+
+
 def human_bytes(count: object) -> str:
     try:
         size = float(count or 0)

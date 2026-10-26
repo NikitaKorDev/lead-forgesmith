@@ -15,6 +15,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from PyQt5.QtCore import Qt, QTimer, QUrl, pyqtSignal
@@ -54,6 +55,8 @@ from forgesmith.gui.commands import (
 from forgesmith.gui.payload import (
     STAGES,
     Kpi,
+    action_argv,
+    action_page,
     blockers_for,
     cell_text,
     doctor_headline,
@@ -223,6 +226,23 @@ def _counted(count: int, noun: str, plural: str | None = None) -> str:
     return f"{count} {plural or noun + 's'}"
 
 
+def _button(text: str, slot: Callable[[], Any], *, tone: str = "") -> QPushButton:
+    """A bulk-action button; ``tone`` is the stylesheet object name (Danger…)."""
+    button = QPushButton(text)
+    if tone:
+        button.setObjectName(tone)
+    button.clicked.connect(lambda _checked=False: slot())
+    return button
+
+
+def _flag_value(argv: list[str], flag: str) -> str | None:
+    """The value following ``flag`` in argv, or None when the flag is absent."""
+    if flag not in argv:
+        return None
+    index = argv.index(flag) + 1
+    return argv[index] if index < len(argv) else None
+
+
 def _clear_layout(layout: QGridLayout) -> None:
     while layout.count():
         item = layout.takeAt(0)
@@ -256,6 +276,20 @@ def _page_header(title: str, subtitle: QLabel, refresh: Callable[[], Any]) -> QH
 
 
 @dataclass
+class Step:
+    """One CLI run, plus how to decide what follows it.
+
+    ``followup`` receives the finished result and returns the steps to run next,
+    which is how a page chains "check eligibility -> enrich -> draft" without
+    duplicating the rule in the window.
+    """
+
+    argv: list[str]
+    json_flag: bool = False
+    followup: Callable[[Result], list[Step]] | None = None
+
+
+@dataclass
 class Ctx:
     """What a page may do without knowing the window.
 
@@ -265,6 +299,7 @@ class Ctx:
     """
 
     run: Callable[..., bool]
+    chain: Callable[..., bool]
     navigate: Callable[..., None]
     notify: Callable[[str, str], None]
     status: Callable[[], dict[str, Any]]
@@ -347,6 +382,27 @@ class Page(QWidget):
         if prompt and not confirm_dialog(self, spec.label, prompt):
             return False
         return self.ctx.run(argv, owner=self)
+
+    # ----------------------------------------------------------- lead actions
+    def lead_action(self, row: dict[str, Any] | None) -> None:
+        """Do the one thing this row's shared state points at.
+
+        ``review`` and ``send`` open the page that owns them; everything else
+        runs that stage's own command with this lead id, so a row never needs
+        its id copied into another page's form.
+        """
+        if not row:
+            self.ctx.notify("Select a lead first.", "warn")
+            return
+        page = action_page(row)
+        if page:
+            self.ctx.navigate(page)
+            return
+        argv = action_argv(row)
+        if not argv:
+            self.ctx.notify(str(row.get("reason") or "Nothing to do for this lead."), "muted")
+            return
+        self.ctx.run(argv, owner=self)
 
 
 class FormPane(QWidget):
@@ -497,9 +553,16 @@ class CollectPage(Page):
             bar.addWidget(QLabel(label))
             bar.addWidget(widget)
         bar.addStretch(1)
+        # One click per lead: the row's own next step, never a copied id.
+        self.act_button = QPushButton("Run next step")
+        self.act_button.setObjectName("Primary")
+        self.act_button.clicked.connect(lambda: self.lead_action(self.table.current_row()))
+        bar.addWidget(self.act_button)
         layout.addLayout(bar)
 
         self.table = TablePane("leads")
+        self.table.set_placeholder("No leads yet — run a source stage above, then enrich them.")
+        self.table.row_activated.connect(self.lead_action)
         layout.addWidget(self.table, 1)
 
     def refresh(self) -> None:
@@ -540,9 +603,24 @@ class EnrichPage(Page):
 
         self.subtitle = muted("leads waiting for a storefront")
         layout.addLayout(_page_header("2 · Enrich", self.subtitle, self.refresh))
+        self._rows: list[dict[str, Any]] = []
 
         self.blockers = BlockerBanner()
         layout.addWidget(self.blockers)
+
+        bulk = QHBoxLayout()
+        bulk.addWidget(QLabel("Bulk"))
+        for count in (25, 50, 200):
+            bulk.addWidget(_button(f"Enrich {count}", partial(self._enrich, count)))
+        bulk.addWidget(_button("Enrich all", partial(self._enrich, None)))
+        bulk.addSpacing(16)
+        # Parked leads need their own run: --force is per lead, so retrying them
+        # must not re-crawl the whole enriched backlog on the way.
+        self.retry_button = _button("Retry parked", self._retry_parked)
+        self.retry_button.setEnabled(False)
+        bulk.addWidget(self.retry_button)
+        bulk.addStretch(1)
+        layout.addLayout(bulk)
 
         splitter = QSplitter(Qt.Vertical)
         self.form = FormPane(command("enrich"))
@@ -553,6 +631,7 @@ class EnrichPage(Page):
         self.tabs.setMinimumHeight(170)
         self.table = TablePane("leads")
         self.table.set_placeholder("Nothing to enrich — every lead is drafted, parked or finished.")
+        self.table.row_activated.connect(self.lead_action)
         self.contacts = TablePane("contacts")
         self.tabs.addTab(self.table, "Queue")
         self.tabs.addTab(self.contacts, "Contacts")
@@ -585,6 +664,7 @@ class EnrichPage(Page):
         super().on_result(result)
         if result.argv[0] == "leads" and result.payload:
             rows = rows_where_action(result.payload, ("enrich", "retry"))
+            self._rows = rows
             self.table.set_rows(rows)
             awaiting = sum(1 for row in rows if row.get("next_action") == "enrich")
             parked = len(rows) - awaiting
@@ -592,11 +672,41 @@ class EnrichPage(Page):
                 f"{awaiting} awaiting enrichment"
                 + (f" · {parked} parked (tick Force to retry)" if parked else "")
             )
+            self.retry_button.setText(f"Retry parked ({parked})")
+            self.retry_button.setEnabled(parked > 0)
         elif result.argv[0] == "contacts" and result.payload:
             self.contacts.set_rows(rows_of(result.payload))
         elif result.argv[0] == "enrich":
             self.ctx.refresh_status()
             self.refresh()
+
+    def _enrich(self, count: int | None) -> None:
+        """Enrich the next ``count`` leads, deep-resolving like the form does."""
+        argv = ["enrich", "--deep-resolve"]
+        if count:
+            argv += ["--limit", str(count)]
+        if self.ctx.run(argv, owner=self):
+            self.form.set_running(True)
+
+    def _retry_parked(self) -> None:
+        """Re-run the parked leads only: one forced pass each, not the backlog.
+
+        ``enrich --force`` selects every new/enriched/skipped lead, so a bulk
+        retry through the flag alone would re-crawl hundreds of finished shops
+        to reach a handful of parked ones. Scoping by lead id is the same
+        command the row's own Retry action runs.
+        """
+        parked = [row for row in self._rows if row.get("next_action") == "retry"]
+        if not parked:
+            self.ctx.notify("No parked leads to retry.", "muted")
+            return
+        steps = [
+            Step(["enrich", "--lead-id", str(row.get("id")), "--deep-resolve", "--force"])
+            for row in parked
+        ]
+        if self.ctx.chain(steps, owner=self):
+            self.form.set_running(True)
+            self.ctx.notify(f"Retrying {_counted(len(parked), 'parked lead')}.", "info")
 
     def _run(self, _spec: Command, argv: list[str]) -> None:
         if self.ctx.run(argv, owner=self):
@@ -606,6 +716,10 @@ class EnrichPage(Page):
         super().on_busy(busy)
         if not busy:
             self.form.set_running(False)
+            # on_busy re-enables every button; a bulk action with nothing to do
+            # must go back to being unavailable.
+            parked = sum(1 for row in self._rows if row.get("next_action") == "retry")
+            self.retry_button.setEnabled(parked > 0)
 
     def apply_values(self, values: dict[str, Any]) -> None:
         self.form.apply_values(values)
@@ -623,9 +737,25 @@ class DraftPage(Page):
 
         self.subtitle = muted("checking what is ready to draft…")
         layout.addLayout(_page_header("3 · Draft", self.subtitle, self.refresh))
+        self._rows: list[dict[str, Any]] = []
 
         self.blockers = BlockerBanner()
         layout.addWidget(self.blockers)
+
+        bulk = QHBoxLayout()
+        self.batch = QSpinBox()
+        self.batch.setRange(1, 500)
+        self.batch.setValue(3)
+        bulk.addWidget(QLabel("Draft"))
+        bulk.addWidget(self.batch)
+        bulk.addWidget(_button("Draft N", self._draft_batch))
+        # One click for the whole eligible batch: the count is the check's, so
+        # the label and the run cannot disagree about how much work this is.
+        self.draft_all = _button("Draft all ready", self._draft_all)
+        self.draft_all.setEnabled(False)
+        bulk.addWidget(self.draft_all)
+        bulk.addStretch(1)
+        layout.addLayout(bulk)
 
         splitter = QSplitter(Qt.Vertical)
         self.form = FormPane(command("compose"))
@@ -636,6 +766,7 @@ class DraftPage(Page):
         self.preview.set_placeholder(
             "No lead is ready to draft — enrich first, or clear the blockers above."
         )
+        self.preview.row_activated.connect(self._activate)
         splitter.addWidget(self.preview)
         self.attach_form(splitter, self.form, table_min=170)
         layout.addWidget(splitter, 1)
@@ -658,16 +789,80 @@ class DraftPage(Page):
         super().on_result(result)
         if result.argv[:2] == ["compose", "--check"] and result.payload:
             rows = rows_of(result.payload, "leads")
+            self._rows = rows
             self.preview.set_rows(rows)
-            eligible = int(result.payload.get("eligible") or 0)
+            # Count what the rows say, not a separate scalar: a bulk button that
+            # claims work the preview cannot show is the bug this page exists for.
+            ready = sum(1 for row in rows if row.get("next_action") == "draft")
             self.subtitle.setText(
-                f"{_counted(eligible, 'lead')} ready to draft · {len(rows)} checked"
+                f"{_counted(ready, 'lead')} ready to draft · {len(rows)} checked"
             )
+            self.draft_all.setText(f"Draft all ready ({ready})")
+            self.draft_all.setEnabled(ready > 0)
         elif result.argv[0] == "compose":
             self.ctx.refresh_status()
             self.refresh()
 
+    def _draft_batch(self) -> None:
+        if self.ctx.run(["compose", "--limit", str(self.batch.value())], owner=self):
+            self.form.set_running(True)
+
+    def _draft_all(self) -> None:
+        if self.ctx.run(["compose"], owner=self):
+            self.form.set_running(True)
+
+    def draft_lead(self, lead_id: int, argv: list[str] | None = None) -> None:
+        """Draft one lead, enriching it first when the shared rule says so.
+
+        The chain asks ``compose --check`` what the lead needs, and enriches at
+        most once. Everything else (already drafted, suppressed, failed cap)
+        falls through to ``compose``, whose no-op note names the rule that
+        rejected it -- the silent ``scanned 0`` was the original complaint.
+
+        ``argv`` is the operator's own command when it came from the form, so
+        flags like ``--regenerate`` survive the detour through the check.
+        """
+        compose_argv = list(argv) if argv else ["compose", "--lead-id", str(lead_id)]
+        check_argv = [compose_argv[0], "--check", "--json", *compose_argv[1:]]
+        tried = {"enriched": False}
+
+        def after_check(result: Result) -> list[Step]:
+            row = next(
+                (
+                    item
+                    for item in rows_of(result.payload, "leads")
+                    if str(item.get("lead_id")) == str(lead_id)
+                ),
+                {},
+            )
+            if row.get("next_action") == "enrich" and not tried["enriched"]:
+                tried["enriched"] = True
+                return [
+                    Step(["enrich", "--lead-id", str(lead_id), "--deep-resolve"]),
+                    Step(check_argv, json_flag=True, followup=after_check),
+                ]
+            return [Step(compose_argv)]
+
+        steps = [Step(check_argv, json_flag=True, followup=after_check)]
+        if self.ctx.chain(steps, owner=self):
+            self.form.set_running(True)
+
+    def _activate(self, row: object) -> None:
+        """Double-click a checked lead: draft it, or say why it cannot be."""
+        if not isinstance(row, dict):
+            return
+        if row.get("next_action") == "draft":
+            self.draft_lead(int(row["lead_id"]))
+        else:
+            self.ctx.notify(str(row.get("reason") or "Nothing to draft here."), "muted")
+
     def _run(self, _spec: Command, argv: list[str]) -> None:
+        # A single-lead run goes through the chain: compose alone would no-op
+        # on a freshly collected lead and leave the operator guessing.
+        lead_id = _flag_value(argv, "--lead-id")
+        if lead_id is not None:
+            self.draft_lead(int(lead_id), argv)
+            return
         if self.ctx.run(argv, owner=self):
             self.form.set_running(True)
 
@@ -675,6 +870,8 @@ class DraftPage(Page):
         super().on_busy(busy)
         if not busy:
             self.form.set_running(False)
+            eligible = sum(1 for row in self._rows if row.get("next_action") == "draft")
+            self.draft_all.setEnabled(eligible > 0)
 
     def apply_values(self, values: dict[str, Any]) -> None:
         self.form.apply_values(values)
@@ -713,6 +910,10 @@ class ApprovePage(Page):
         self.filter.currentIndexChanged.connect(lambda _index: self._fill())
         bar.addWidget(self.filter)
         bar.addStretch(1)
+        # Bulk approval sits next to the single one: same gate, same review list.
+        self.approve_all = _button("Approve all (0)", self._approve_all)
+        self.approve_all.setEnabled(False)
+        bar.addWidget(self.approve_all)
         for text, slot in (
             ("Approve", self._approve),
             ("Unapprove", self._unapprove),
@@ -763,6 +964,14 @@ class ApprovePage(Page):
         composed = sum(1 for row in self._rows if row.get("lead_status") == "composed")
         queued = sum(1 for row in self._rows if row.get("lead_status") == "queued")
         self.subtitle.setText(f"{composed} awaiting review · {queued} queued · showing {len(rows)}")
+        self.approve_all.setText(f"Approve all ({composed})")
+        self.approve_all.setEnabled(composed > 0)
+
+    def on_busy(self, busy: bool) -> None:
+        super().on_busy(busy)
+        if not busy:
+            composed = sum(1 for row in self._rows if row.get("lead_status") == "composed")
+            self.approve_all.setEnabled(composed > 0)
 
     def _show_detail(self, row: object) -> None:
         if not isinstance(row, dict):
@@ -791,6 +1000,37 @@ class ApprovePage(Page):
                 command("approve"),
                 {"lead_id": row["lead_id"], "message_id": row["message_id"]},
             )
+
+    def _approve_all(self) -> None:
+        """Approve every composed draft the table is showing, after a review list."""
+        rows = [row for row in self._rows if row.get("lead_status") == "composed"]
+        if not rows:
+            self.ctx.notify("Nothing is awaiting review.", "muted")
+            return
+        lines = []
+        for row in rows[:12]:
+            subject = " ".join(str(row.get("subject") or "").split())[:58]
+            lines.append(
+                f"lead {row.get('lead_id')} · {row.get('company') or '-'} · "
+                f"{row.get('contact')} · {subject}"
+            )
+        if len(rows) > 12:
+            lines.append(f"… and {len(rows) - 12} more")
+        truncated = (
+            f"\n\nThe table is capped at {self.limit.value()} rows; only these are approved."
+            if len(self._rows) >= self.limit.value()
+            else ""
+        )
+        if not confirm_dialog(
+            self,
+            "Approve all",
+            f"Approve {_counted(len(rows), 'draft')}?\n\n"
+            + "\n".join(lines)
+            + truncated
+            + "\n\nEach lead moves to `queued` and may be delivered by the next send run.",
+        ):
+            return
+        self.ctx.run(["approve", "--all-composed", "--yes", "--limit", str(len(rows))], owner=self)
 
     def _unapprove(self) -> None:
         row = self._selected()
@@ -830,9 +1070,26 @@ class SendPage(Page):
 
         self.subtitle = muted("reading policy…")
         layout.addLayout(_page_header("5 · Send", self.subtitle, self.refresh))
+        self._drafts: list[dict[str, Any]] = []
 
         self.blockers = BlockerBanner()
         layout.addWidget(self.blockers)
+
+        bulk = QHBoxLayout()
+        self.batch = QSpinBox()
+        self.batch.setRange(1, 100)
+        self.batch.setValue(5)
+        bulk.addWidget(QLabel("Batch"))
+        bulk.addWidget(self.batch)
+        bulk.addWidget(_button("Dry run", self._dry_run))
+        live = _button("Send live", self._send_live, tone="Danger")
+        live.setToolTip(
+            "Real SMTP delivery. Caps, the sending window and suppressions are "
+            "still enforced by the CLI."
+        )
+        bulk.addWidget(live)
+        bulk.addStretch(1)
+        layout.addLayout(bulk)
 
         splitter = QSplitter(Qt.Vertical)
         self.form = FormPane(command("send"))
@@ -851,6 +1108,9 @@ class SendPage(Page):
         self.ctx.run(
             ["leads", "--json", "--status", "queued", "--limit", "200"], json_flag=True, owner=self
         )
+        # The recipient list behind the live-send confirmation: `leads` names the
+        # queue, but only `drafts` carries the address each message goes to.
+        self.ctx.run(["drafts", "--json", "--limit", "200"], json_flag=True, owner=self)
 
     def on_status(self, payload: dict[str, Any]) -> None:
         self.blockers.set_blockers(blockers_for(payload, "send"))
@@ -867,9 +1127,40 @@ class SendPage(Page):
         if result.argv[0] == "leads" and result.payload:
             rows = rows_of(result.payload)
             self.queue.set_rows(rows)
+        elif result.argv[0] == "drafts" and result.payload:
+            self._drafts = rows_of(result.payload)
         elif result.argv[0] == "send":
             self.ctx.refresh_status()
             self.refresh()
+
+    def _dry_run(self) -> None:
+        """Render .eml evidence for a batch; nothing leaves the machine."""
+        count = self.batch.value()
+        if self.ctx.run(["send", "--yes", "--limit", str(count)], owner=self):
+            self.form.set_running(True)
+
+    def _send_live(self) -> None:
+        """Deliver for real, behind a recipient list: this cannot be undone."""
+        count = self.batch.value()
+        queued = [row for row in self._drafts if row.get("lead_status") == "queued"]
+        lines = [
+            f"lead {row.get('lead_id')} · {row.get('company') or '-'} · {row.get('contact')}"
+            for row in queued[:8]
+        ]
+        if len(queued) > 8:
+            lines.append(f"… and {len(queued) - 8} more")
+        listed = "\n".join(lines) if lines else "No approved draft is loaded — press Refresh."
+        if not confirm_dialog(
+            self,
+            "Send live",
+            f"Deliver up to {_counted(count, 'real email')} over SMTP?\n\n"
+            f"{listed}\n\n"
+            "This cannot be undone. The kill switch, the sending window, the daily cap "
+            "and suppressions are still enforced by the CLI.",
+        ):
+            return
+        if self.ctx.run(["send", "--live", "--yes", "--limit", str(count)], owner=self):
+            self.form.set_running(True)
 
     def _run(self, _spec: Command, argv: list[str]) -> None:
         if self.ctx.run(argv, owner=self):
@@ -1124,10 +1415,12 @@ class MainWindow(QMainWindow):
         self.runner.finished.connect(self._on_finished)
 
         self._status: dict[str, Any] = {}
-        self._queue: deque[tuple[list[str], bool, Page | None]] = deque()
+        self._queue: deque[tuple[Step, Page | None]] = deque()
+        self._step: Step | None = None
         self._owner: Page | None = None
         self.ctx = Ctx(
             run=self.run_stage,
+            chain=self.run_chain,
             navigate=self.navigate,
             notify=self.notify,
             status=lambda: self._status,
@@ -1247,30 +1540,40 @@ class MainWindow(QMainWindow):
         *,
         json_flag: bool = False,
         owner: Page | None = None,
+        followup: Callable[[Result], list[Step]] | None = None,
     ) -> bool:
         """Start one stage, or queue it behind the running one.
 
-        The queue is what makes a chain like enrich -> status -> compose safe:
-        one process at a time, in the order the pages asked for them.
+        The queue is what makes a chain like enrich -> compose safe: one process
+        at a time, in the order the pages asked for them. ``followup`` may add
+        steps once this one finishes, which is how "draft this lead, enriching it
+        first" stays a single click without the GUI guessing eligibility.
         """
-        if self.runner.busy or self._queue:
-            self._queue.append((list(argv), json_flag, owner))
-            if owner is not None and argv[:1] != ["status"]:
-                self.notify(f"Queued ({len(self._queue)}): forgesmith {' '.join(argv)}", "info")
-            return True
-        return self._start(list(argv), json_flag=json_flag, owner=owner)
+        step = Step(list(argv), json_flag=json_flag, followup=followup)
+        return self.run_chain([step], owner=owner)
 
-    def _start(
-        self,
-        argv: list[str],
-        *,
-        json_flag: bool = False,
-        owner: Page | None = None,
-    ) -> bool:
+    def run_chain(self, steps: list[Step], *, owner: Page | None = None) -> bool:
+        """Queue a short sequence of stages; the first one starts now if idle."""
+        if not steps:
+            return False
+        busy = self.runner.busy or bool(self._queue)
+        self._queue.extend((step, owner) for step in steps)
+        if busy:
+            if owner is not None and steps[0].argv[:1] != ["status"]:
+                self.notify(
+                    f"Queued ({len(self._queue)}): forgesmith {' '.join(steps[0].argv)}",
+                    "info",
+                )
+            return True
+        step, step_owner = self._queue.popleft()
+        return self._start(step, owner=step_owner)
+
+    def _start(self, step: Step, *, owner: Page | None = None) -> bool:
+        self._step = step
         self._owner = owner
-        self.console.begin("forgesmith " + " ".join(argv))
+        self.console.begin("forgesmith " + " ".join(step.argv))
         self._set_busy(True)
-        started = self.runner.start(argv, json_flag=json_flag)
+        started = self.runner.start(step.argv, json_flag=step.json_flag)
         if not started:
             self._set_busy(False)
             self.notify("Could not start the stage.", "bad")
@@ -1284,7 +1587,7 @@ class MainWindow(QMainWindow):
         """Ask for a fresh ``status --json`` unless one is already in flight."""
         if self.runner.busy and self.runner.argv[:1] == ["status"]:
             return
-        if any(item[0][:1] == ["status"] for item in self._queue):
+        if any(item[0].argv[:1] == ["status"] for item in self._queue):
             return
         self.run_stage(["status", "--json"], json_flag=True, owner=None)
 
@@ -1328,9 +1631,20 @@ class MainWindow(QMainWindow):
             if page is not owner and page is not current and hasattr(page, "mark_stale"):
                 page.mark_stale()
 
+        step, self._step = self._step, None
+        if step is not None and step.followup is not None and not result.cancelled:
+            try:
+                chained = step.followup(result)
+            except Exception as exc:  # a bad follow-up must not kill the console
+                self.console.append(f"\n[gui] chain: {type(exc).__name__}: {exc}\n", "err")
+                chained = []
+            if chained:
+                # The chain continues before anything the pages queued.
+                self._queue.extendleft((item, owner) for item in reversed(chained))
+
         if self._queue:
-            argv, json_flag, queued_owner = self._queue.popleft()
-            self._start(argv, json_flag=json_flag, owner=queued_owner)
+            queued_step, queued_owner = self._queue.popleft()
+            self._start(queued_step, owner=queued_owner)
             return
 
         self._set_busy(False)
