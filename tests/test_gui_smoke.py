@@ -361,3 +361,59 @@ def test_send_live_is_skipped_when_the_operator_cancels(
     page._send_live()
 
     assert len(window.calls) == before
+
+
+# ------------------------------------------------------------ finding things
+def test_the_collect_search_narrows_the_table_without_a_run(window: _StubWindow) -> None:
+    page = window.pages["collect"]
+    page._rows = [
+        {"id": 1, "name": "Meblex", "domain": "meblex.pl", "city": "Gdańsk"},
+        {"id": 2, "name": "Inne", "domain": "inne.com", "city": "Kraków"},
+    ]
+    page._total = 2
+    before = len(window.calls)
+
+    page.search.setText("krak")
+
+    assert page.table.table.rowCount() == 1
+    assert len(window.calls) == before, "searching is client-side, not a CLI run"
+    page.search.setText("")
+    assert page.table.table.rowCount() == 2
+
+
+def test_a_review_row_opens_the_approve_page_on_that_lead(window: _StubWindow) -> None:
+    page = window.pages["collect"]
+
+    page.lead_action({"id": 38, "next_action": "review", "reason": ""})
+
+    assert window.stack.currentWidget() is window.pages["approve"]
+    assert window.pages["approve"].search.text() == "38"
+
+
+def test_open_lead_jumps_to_collect_with_the_search_filled(window: _StubWindow) -> None:
+    page = window.pages["approve"]
+    page._rows = [
+        {
+            "lead_id": 38,
+            "message_id": 6,
+            "company": "regama.pl",
+            "contact": "biuro@regama.pl",
+            "subject": "Wspolpraca",
+            "lead_status": "composed",
+        }
+    ]
+    page._fill()
+
+    page._open_lead()
+
+    assert window.stack.currentWidget() is window.pages["collect"]
+    assert window.pages["collect"].search.text() == "regama.pl"
+
+
+def test_ctrl_enter_runs_the_current_pages_form(window: _StubWindow) -> None:
+    window.navigate("enrich")
+
+    window._run_current_form()
+
+    assert window.calls[-1][0][0] == "enrich"
+    assert "--deep-resolve" in window.calls[-1][0]

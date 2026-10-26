@@ -50,35 +50,45 @@ uv sync --extra gui          # PyQt5 is an optional extra; the pipeline stays he
 uv run forgesmith-gui        # or: uv run python -m forgesmith.gui
 ```
 
+The window is the pipeline, not a menu of commands. A stage strip across the top
+carries the live count for every stage (the number of leads that stage's own CLI
+run would select, from `status --json`), and each page owns its own blockers, so
+a run that would no-op says why before you press it.
+
 | Page | What it does |
 |---|---|
-| Dashboard | `status` + `doctor` cards, doctor checks, run ledger, 30 s auto-refresh |
-| Prospects | `leads` and `contacts` tables; jump to enrich/compose/approve/mark for a row |
-| Drafts | `drafts` with the full body beside the table; approve, unapprove, suppress, copy |
-| Sources | `source shopify`, `source olx` |
-| Enrichment | `enrich` (including `--resolve-only` and `--deep-resolve`) |
-| Compose | `compose` with a link straight to review |
-| Mailer | `send` (dry run or `--live`), live policy line from `status` |
-| Ledger | `sends` + `outbox`, open an `.eml`, resolve an uncertain attempt |
-| Inbox | `inbox sync`, `inbox list`, `inbox show`, `inbox apply` |
-| Operations | `db init`, `doctor`, `backup`, `mark`, `suppress`, `unsuppress`, `stats`, `version` |
+| Pipeline | One **next step** card (replies → approve → send → draft → enrich → collect → done: finish work in flight first) plus the CLI's blockers and funnel |
+| 1 · Collect | `source shopify`, `source olx`, and the newest leads — each row's `next` column is the one action it needs |
+| 2 · Enrich | `enrich` form, **Enrich 25/50/200/all**, **Retry parked**, the queue and the contacts it produced |
+| 3 · Draft | `compose --check` preview (eligibility only, no Ollama), **Draft N**, **Draft all ready**, and a single lead that enriches itself first |
+| 4 · Approve | `drafts` with the full body beside the table: approve, **Approve all (N)**, unapprove, suppress, open lead, copy body |
+| 5 · Send | `send` dry run or live, a **Batch** size, and the policy line from `status` |
+| 6 · Replies | `inbox sync`, `inbox list`, `inbox show`, `inbox apply` |
+| Tools | `sends` + `outbox` (open an `.eml`, resolve an uncertain attempt) and the maintenance commands |
 
 Notes that matter in practice:
 
 - **Confirmation is the modal.** A subprocess has no TTY, so the app appends
   `--yes` for bulk commands; the warning dialog in front of you *is* the human
-  approval. `send --live` additionally shows a red LIVE banner and its own
-  dialog, and still needs `FORGESMITH_MAIL_DRY_RUN=false`.
+  approval. Bulk approval lists the company, contact and subject it is about to
+  queue, and **Send live** (red) lists the recipients before it opens SMTP. Live
+  send still needs `FORGESMITH_MAIL_DRY_RUN=false`.
 - **One stage at a time.** The runner owns a single process; **Stop** kills it
-  (SIGTERM/Kill) and the CLI's own stop handling still runs.
+  (SIGTERM/Kill) and the CLI's own stop handling still runs. Chained work (check
+  → enrich → compose) queues behind it in order.
+- **A row has one action.** `next` comes from the shared eligibility rule in
+  `forgesmith.eligibility`, so the GUI never decides whether a lead is eligible —
+  it only turns that state into flags (`forgesmith.gui.payload.action_argv`).
 - **`--json` is the contract.** Read-only commands accept `--json`; the GUI
   renders those payloads and buffers the raw JSON out of the console. stderr
   still streams, so warnings and tracebacks stay visible.
 - **Settings come from the repo root.** `.env` is read from the project
   directory, not from wherever you launched the app, and stages run with that
   directory as their working directory.
-- Tables sort by real values (ids sort `9 < 51`), and every page refreshes on
-  show once the runner is free.
+- **Finding things.** Tables search client-side (`Search…`), sort by real values
+  (ids sort `9 < 51`), and every page refreshes on show once the runner is free.
+- **Keyboard.** `F5` refresh, `Ctrl+Enter` run the current page's form,
+  `Ctrl+1…8` jump to a page. The window reopens at the last page and size.
 
 ## Commands
 

@@ -18,8 +18,8 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
-from PyQt5.QtCore import Qt, QTimer, QUrl, pyqtSignal
-from PyQt5.QtGui import QCloseEvent, QDesktopServices, QFont
+from PyQt5.QtCore import QSettings, Qt, QTimer, QUrl, pyqtSignal
+from PyQt5.QtGui import QCloseEvent, QDesktopServices, QFont, QKeySequence
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -28,11 +28,13 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QShortcut,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -63,6 +65,7 @@ from forgesmith.gui.payload import (
     doctor_rows,
     funnel_line,
     next_step,
+    rows_matching,
     rows_of,
     rows_where_action,
     run_rows,
@@ -396,7 +399,7 @@ class Page(QWidget):
             return
         page = action_page(row)
         if page:
-            self.ctx.navigate(page)
+            self.ctx.navigate(page, {"lead_id": row.get("id")})
             return
         argv = action_argv(row)
         if not argv:
@@ -514,7 +517,7 @@ class PipelinePage(Page):
 
 # -------------------------------------------------------------------- collect
 class CollectPage(Page):
-    """Where leads come from: the two sources, plus what they already stored."""
+    """Where leads come from: the three sources, plus what they already stored."""
 
     def __init__(self, ctx: Ctx, parent: QWidget | None = None) -> None:
         super().__init__(ctx, parent)
@@ -524,24 +527,34 @@ class CollectPage(Page):
 
         self.subtitle = muted("newest leads in the database")
         layout.addLayout(_page_header("1 · Collect", self.subtitle, self.refresh))
+        self._rows: list[dict[str, Any]] = []
+        self._total = 0
 
         sources = QHBoxLayout()
         sources.setSpacing(10)
-        for spec_id in ("source_shopify", "source_olx"):
+        for spec_id in ("source_shopify", "source_olx", "source_overture"):
             card = CommandCard(command(spec_id))
             card.run_requested.connect(lambda _spec, argv: ctx.run(argv, owner=self))
             sources.addWidget(card, 1)
         layout.addLayout(sources)
 
         bar = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search…")
+        self.search.setClearButtonEnabled(True)
+        self.search.setMinimumWidth(180)
+        self.search.textChanged.connect(lambda _text: self._fill())
+        bar.addWidget(self.search)
         self.status_filter = QComboBox()
         self.status_filter.addItem("any status", None)
         for status in LEAD_STATUSES:
             self.status_filter.addItem(status, status)
+        self.status_filter.currentIndexChanged.connect(lambda _index: self.refresh())
         self.source_filter = QComboBox()
         self.source_filter.addItem("any source", None)
         for source in SOURCES:
             self.source_filter.addItem(source, source)
+        self.source_filter.currentIndexChanged.connect(lambda _index: self.refresh())
         self.limit = QSpinBox()
         self.limit.setRange(1, 5000)
         self.limit.setValue(200)
@@ -579,10 +592,19 @@ class CollectPage(Page):
     def on_result(self, result: Result) -> None:
         super().on_result(result)
         if result.argv[0] == "leads" and result.payload:
-            rows = rows_of(result.payload)
-            self.table.set_rows(rows)
-            total = result.payload.get("total")
-            self.subtitle.setText(f"{total} leads stored · showing the newest {len(rows)}")
+            self._rows = rows_of(result.payload)
+            self._total = int(result.payload.get("total") or len(self._rows))
+            self._fill()
+
+    def _fill(self) -> None:
+        rows = rows_matching(self._rows, self.search.text())
+        self.table.set_rows(rows)
+        self.subtitle.setText(f"{self._total} leads stored · {len(rows)} shown")
+
+    def apply_values(self, values: dict[str, Any]) -> None:
+        """Jump in from another page: narrow the table to what was clicked."""
+        if values.get("search") is not None:
+            self.search.setText(str(values["search"]))
 
     def on_busy(self, busy: bool) -> None:
         for button in self.findChildren(QPushButton):
@@ -619,6 +641,13 @@ class EnrichPage(Page):
         self.retry_button = _button("Retry parked", self._retry_parked)
         self.retry_button.setEnabled(False)
         bulk.addWidget(self.retry_button)
+        bulk.addSpacing(16)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search the queue…")
+        self.search.setClearButtonEnabled(True)
+        self.search.setMinimumWidth(200)
+        self.search.textChanged.connect(lambda _text: self._fill())
+        bulk.addWidget(self.search)
         bulk.addStretch(1)
         layout.addLayout(bulk)
 
@@ -663,22 +692,26 @@ class EnrichPage(Page):
     def on_result(self, result: Result) -> None:
         super().on_result(result)
         if result.argv[0] == "leads" and result.payload:
-            rows = rows_where_action(result.payload, ("enrich", "retry"))
-            self._rows = rows
-            self.table.set_rows(rows)
-            awaiting = sum(1 for row in rows if row.get("next_action") == "enrich")
-            parked = len(rows) - awaiting
-            self.subtitle.setText(
-                f"{awaiting} awaiting enrichment"
-                + (f" · {parked} parked (tick Force to retry)" if parked else "")
-            )
-            self.retry_button.setText(f"Retry parked ({parked})")
-            self.retry_button.setEnabled(parked > 0)
+            self._rows = rows_where_action(result.payload, ("enrich", "retry"))
+            self._fill()
         elif result.argv[0] == "contacts" and result.payload:
             self.contacts.set_rows(rows_of(result.payload))
         elif result.argv[0] == "enrich":
             self.ctx.refresh_status()
             self.refresh()
+
+    def _fill(self) -> None:
+        rows = rows_matching(self._rows, self.search.text())
+        self.table.set_rows(rows)
+        awaiting = sum(1 for row in self._rows if row.get("next_action") == "enrich")
+        parked = len(self._rows) - awaiting
+        self.subtitle.setText(
+            f"{awaiting} awaiting enrichment"
+            + (f" · {parked} parked (tick Force to retry)" if parked else "")
+            + (f" · {len(rows)} shown" if len(rows) != len(self._rows) else "")
+        )
+        self.retry_button.setText(f"Retry parked ({parked})")
+        self.retry_button.setEnabled(parked > 0)
 
     def _enrich(self, count: int | None) -> None:
         """Enrich the next ``count`` leads, deep-resolving like the form does."""
@@ -794,9 +827,7 @@ class DraftPage(Page):
             # Count what the rows say, not a separate scalar: a bulk button that
             # claims work the preview cannot show is the bug this page exists for.
             ready = sum(1 for row in rows if row.get("next_action") == "draft")
-            self.subtitle.setText(
-                f"{_counted(ready, 'lead')} ready to draft · {len(rows)} checked"
-            )
+            self.subtitle.setText(f"{_counted(ready, 'lead')} ready to draft · {len(rows)} checked")
             self.draft_all.setText(f"Draft all ready ({ready})")
             self.draft_all.setEnabled(ready > 0)
         elif result.argv[0] == "compose":
@@ -892,6 +923,12 @@ class ApprovePage(Page):
         self._rows: list[dict[str, Any]] = []
 
         bar = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search drafts…")
+        self.search.setClearButtonEnabled(True)
+        self.search.setMinimumWidth(160)
+        self.search.textChanged.connect(lambda _text: self._fill())
+        bar.addWidget(self.search)
         self.limit = QSpinBox()
         self.limit.setRange(1, 2000)
         self.limit.setValue(200)
@@ -918,6 +955,7 @@ class ApprovePage(Page):
             ("Approve", self._approve),
             ("Unapprove", self._unapprove),
             ("Suppress email", self._suppress),
+            ("Open lead", self._open_lead),
             ("Copy body", self._copy_body),
         ):
             button = QPushButton(text)
@@ -960,12 +998,18 @@ class ApprovePage(Page):
     def _fill(self) -> None:
         wanted = self.filter.currentData()
         rows = [row for row in self._rows if wanted is None or row.get("lead_status") == wanted]
+        rows = rows_matching(rows, self.search.text())
         self.table.set_rows(rows)
         composed = sum(1 for row in self._rows if row.get("lead_status") == "composed")
         queued = sum(1 for row in self._rows if row.get("lead_status") == "queued")
         self.subtitle.setText(f"{composed} awaiting review · {queued} queued · showing {len(rows)}")
         self.approve_all.setText(f"Approve all ({composed})")
         self.approve_all.setEnabled(composed > 0)
+
+    def apply_values(self, values: dict[str, Any]) -> None:
+        """Jump in from a lead row: land on that lead's draft."""
+        if values.get("lead_id") is not None:
+            self.search.setText(str(values["lead_id"]))
 
     def on_busy(self, busy: bool) -> None:
         super().on_busy(busy)
@@ -1056,6 +1100,14 @@ class ApprovePage(Page):
             return
         QApplication.clipboard().setText(str(row.get("body") or ""))
         self.ctx.notify("Draft body copied to clipboard.", "ok")
+
+    def _open_lead(self) -> None:
+        """Follow a draft back to its lead: the Collect table filtered to it."""
+        row = self._selected()
+        if not row:
+            return
+        needle = str(row.get("company") or row.get("lead_id") or "")
+        self.ctx.navigate("collect", {"search": needle})
 
 
 # ----------------------------------------------------------------------- send
@@ -1418,6 +1470,7 @@ class MainWindow(QMainWindow):
         self._queue: deque[tuple[Step, Page | None]] = deque()
         self._step: Step | None = None
         self._owner: Page | None = None
+        self._page_id = "pipeline"
         self.ctx = Ctx(
             run=self.run_stage,
             chain=self.run_chain,
@@ -1470,13 +1523,65 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(0)
         self._sync_nav("pipeline")
         self.statusBar().showMessage("Ready")
+        self._shortcuts()
 
         self._timer = QTimer(self)
         self._timer.setInterval(30_000)
         self._timer.timeout.connect(self._auto_refresh)
         self._timer.start()
 
+        self._restore_geometry()
         QTimer.singleShot(200, self._startup)
+
+    # -------------------------------------------------------------- shortcuts
+    def _shortcuts(self) -> None:
+        """Keyboard for the whole pipeline: one hand never leaves the keys."""
+        for index, page_id in enumerate(self._page_ids, start=1):
+            shortcut = QShortcut(QKeySequence(f"Ctrl+{index}"), self)
+            shortcut.activated.connect(partial(self.navigate, page_id))
+        run = QShortcut(QKeySequence("Ctrl+Return"), self)
+        run.activated.connect(self._run_current_form)
+        run_alt = QShortcut(QKeySequence("Ctrl+Enter"), self)
+        run_alt.activated.connect(self._run_current_form)
+
+    def _run_current_form(self) -> None:
+        """Ctrl+Enter: press the current page's Run button from anywhere."""
+        page = self.stack.currentWidget()
+        form = getattr(page, "form", None)
+        card = form.card if form is not None else getattr(page, "card", None)
+        if card is None:
+            self.notify("This page has no form to run.", "muted")
+            return
+        card.submit()
+
+    # --------------------------------------------------------------- geometry
+    def _settings(self) -> QSettings:
+        return QSettings("forgesmith", "console")
+
+    def _restore_geometry(self) -> None:
+        """Reopen where the operator left off; a first run keeps the defaults."""
+        settings = self._settings()
+        geometry = settings.value("geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        page_id = settings.value("page")
+        if isinstance(page_id, str) and page_id in self._page_ids:
+            self.navigate(page_id)
+        height = settings.value("console_height")
+        if height is not None:
+            dock = self.findChild(QDockWidget, "ConsoleDock")
+            if dock is not None:
+                self.resizeDocks([dock], [int(height)], Qt.Vertical)
+
+    def _save_geometry(self) -> None:
+        if not self.isVisible():
+            return  # a test window was never on screen: leave the operator's alone
+        settings = self._settings()
+        settings.setValue("geometry", self.saveGeometry())
+        settings.setValue("page", self._page_id)
+        dock = self.findChild(QDockWidget, "ConsoleDock")
+        if dock is not None:
+            settings.setValue("console_height", dock.height())
 
     # ------------------------------------------------------------------ chrome
     def _header(self) -> QWidget:
@@ -1671,6 +1776,7 @@ class MainWindow(QMainWindow):
     def navigate(self, page_id: str, values: dict[str, Any] | None = None) -> None:
         if page_id not in self._page_ids:
             return
+        self._page_id = page_id
         self.stack.setCurrentIndex(self._page_ids.index(page_id))
         self._sync_nav(page_id)
         page = self.pages[page_id]
@@ -1726,6 +1832,7 @@ class MainWindow(QMainWindow):
                 return
             self.runner.cancel()
         self._queue.clear()
+        self._save_geometry()
         event.accept()
 
 

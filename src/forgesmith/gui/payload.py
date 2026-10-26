@@ -90,6 +90,37 @@ def action_page(row: dict[str, Any]) -> str:
     return ACTION_PAGES.get(str(row.get("next_action") or ""), "")
 
 
+#: Fields a table search looks at, in the order an operator would type them.
+SEARCH_KEYS = (
+    "id",
+    "lead_id",
+    "name",
+    "company",
+    "domain",
+    "city",
+    "category",
+    "contact",
+    "subject",
+    "status",
+)
+
+
+def rows_matching(rows: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
+    """Client-side search: keep the rows whose fields contain ``text``.
+
+    Display-only, like :func:`rows_where_action`: the CLI still owns selection,
+    and an empty box means "everything the stage loaded".
+    """
+    needle = " ".join(text.split()).casefold()
+    if not needle:
+        return list(rows)
+    return [
+        row
+        for row in rows
+        if needle in " ".join(str(row.get(key) or "") for key in SEARCH_KEYS).casefold()
+    ]
+
+
 def human_bytes(count: object) -> str:
     try:
         size = float(count or 0)

@@ -490,6 +490,14 @@ class CommandCard(QGroupBox):
         self.notice.style().unpolish(self.notice)
         self.notice.style().polish(self.notice)
 
+    def submit(self) -> None:
+        """Validate and emit a run, exactly as pressing Run would.
+
+        Public so the window's Ctrl+Enter shortcut can start the current page's
+        stage without reaching into the button.
+        """
+        self._submit()
+
     def _submit(self) -> None:
         values = self.form.values()
         try:

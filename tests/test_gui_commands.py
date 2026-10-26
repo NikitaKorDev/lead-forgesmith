@@ -25,6 +25,7 @@ from forgesmith.gui.payload import (
     human_bytes,
     next_step,
     parse_payload,
+    rows_matching,
     rows_of,
     rows_where_action,
     run_rows,
@@ -360,6 +361,18 @@ def test_action_page_opens_the_page_that_owns_the_gate() -> None:
     assert action_page({"next_action": "send"}) == "send"
     assert action_page({"next_action": "enrich"}) == ""
     assert action_page({}) == ""
+
+
+def test_rows_matching_searches_what_an_operator_types() -> None:
+    rows = [
+        {"id": 12, "name": "Meblex", "domain": "meblex.pl", "city": "Gdańsk"},
+        {"id": 13, "name": "Inne", "domain": "inne.com", "city": "Kraków"},
+    ]
+    assert [row["id"] for row in rows_matching(rows, "gdań")] == [12]
+    assert [row["id"] for row in rows_matching(rows, "  MEBLEX ")] == [12]
+    assert [row["id"] for row in rows_matching(rows, "13")] == [13]
+    assert [row["id"] for row in rows_matching(rows, "")] == [12, 13]
+    assert rows_matching(rows, "zzz") == []
 
 
 def test_stage_counts_read_the_funnel_and_the_inbox() -> None:
